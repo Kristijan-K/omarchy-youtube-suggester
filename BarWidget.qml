@@ -35,6 +35,18 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  Process {
+    id: fallbackConfigProcess
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && root.liveService) root.liveService.loadStatus()
+      else if (exitCode === 0) {
+        console.log("youtube-suggestor: fallback save done, service will pick it up on next open")
+      }
+    }
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
@@ -507,19 +519,6 @@ Panel {
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           horizontalAlignment: Text.AlignHCenter
-        }
-      }
-    }
-
-    Process {
-      id: fallbackConfigProcess
-      stdout: StdioCollector { waitForEnd: true }
-      stderr: StdioCollector { waitForEnd: true }
-      onExited: function(exitCode) {
-        if (exitCode === 0 && root.liveService) root.liveService.loadStatus()
-        else if (exitCode === 0) {
-          // service not ready yet, just log
-          console.log("youtube-suggestor: fallback save done, service will pick it up on next open")
         }
       }
     }
