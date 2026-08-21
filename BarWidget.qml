@@ -2,7 +2,6 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
-import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
@@ -27,25 +26,8 @@ Panel {
   readonly property bool showingRecent: root.recs.length === 0 && root.recentItems.length > 0
   readonly property bool busy: liveService ? liveService.busy : false
   readonly property string stage: liveService ? liveService.stage : "idle"
-  readonly property string engineScript: {
-    var raw = Qt.resolvedUrl("bin/omarchy-youtube-suggestor").toString()
-    return raw.indexOf("file://") === 0 ? raw.substring(7) : raw
-  }
-
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
-
-  Process {
-    id: fallbackConfigProcess
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode === 0 && root.liveService) root.liveService.loadStatus()
-      else if (exitCode === 0) {
-        console.log("youtube-suggestor: fallback save done, service will pick it up on next open")
-      }
-    }
-  }
 
   BarIconButton {
     id: button
@@ -105,14 +87,14 @@ Panel {
 
   function commitInterests() {
     console.log("youtube-suggestor: commit draft=" + interestsDraft)
+    if (!root.liveService) {
+      console.log("youtube-suggestor: no liveService, abort")
+      editingInterests = false
+      return
+    }
     var keywords = interestsDraft.split(",").map(function(k) { return k.trim() }).filter(function(k) { return k.length > 0 }).slice(0, 5)
     console.log("youtube-suggestor: saving keywords=" + JSON.stringify(keywords))
-    if (root.liveService) {
-      root.liveService.saveInterests(keywords)
-    } else {
-      fallbackConfigProcess.command = [root.engineScript, "config", "set", "--interests", keywords.join(",")]
-      fallbackConfigProcess.running = true
-    }
+    root.liveService.saveInterests(keywords)
     editingInterests = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
