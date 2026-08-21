@@ -79,7 +79,7 @@ Panel {
     interestsDraft = root.liveService ? root.liveService.interests.join(", ") : ""
     editingInterests = true
     Qt.callLater(function() {
-      interestsInput.forceActiveFocus()
+      interestsInput.text = interestsDraft
       interestsInput.cursorPosition = interestsInput.text.length
     })
   }
@@ -89,6 +89,7 @@ Panel {
     var keywords = interestsDraft.split(",").map(function(k) { return k.trim() }).filter(function(k) { return k.length > 0 })
     root.liveService.saveInterests(keywords.slice(0, 5))
     editingInterests = false
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   KeyboardPanel {
@@ -97,7 +98,7 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: root.editingInterests ? interestsInput : keyCatcher
     contentWidth: Style.space(700)
     contentHeight: Style.space(640)
 
@@ -145,7 +146,7 @@ Panel {
                     ? (root.liveService.transcribingItem.title || "") : ""
                   return "Transcribing" + (t ? ": " + t : "…") + " — you can close this panel"
                 }
-                if (root.lastError !== "") return root.lastError
+                if (root.liveService && root.liveService.lastError !== "") return root.liveService.lastError
                 if (root.busy) {
                   var p = Model.progressText(root.liveService.state)
                   return Model.stageLabel(root.stage) + (p ? " (" + p + ")" : "")
@@ -178,7 +179,7 @@ Panel {
           id: findButton
           Layout.fillWidth: true
           implicitHeight: findLabel.implicitHeight + Style.space(14)
-          radius: Style.rounding.small
+          radius: Style.cornerRadius
           color: !root.liveService || root.busy
             ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.06)
             : findMouse.containsPress
@@ -253,7 +254,7 @@ Panel {
 
             Text {
               visible: (root.liveService ? root.liveService.interests.length : 0) === 0
-              text: "none set — press T to add up to 5 keywords"
+              text: "none set — press E to add up to 5 keywords"
               textFormat: Text.PlainText
               color: Qt.darker(Color.foreground, 1.8)
               font.family: Style.font.family
@@ -265,24 +266,33 @@ Panel {
           TextInput {
             id: interestsInput
             visible: root.editingInterests
+            focus: root.editingInterests
             Layout.fillWidth: true
-            text: root.interestsDraft
             color: Color.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             wrapMode: TextInput.NoWrap
+            selectByMouse: true
             onTextChanged: root.interestsDraft = text
             onAccepted: root.commitInterests()
+            Keys.onReturnPressed: function(event) {
+              root.commitInterests()
+              event.accepted = true
+            }
+            Keys.onEnterPressed: function(event) {
+              root.commitInterests()
+              event.accepted = true
+            }
             Keys.onEscapePressed: function(event) {
               root.editingInterests = false
               event.accepted = true
-              keyCatcher.forceActiveFocus()
+              Qt.callLater(function() { keyCatcher.forceActiveFocus() })
             }
           }
 
           Text {
             visible: !root.editingInterests
-            text: "[T] edit"
+            text: "[E] edit"
             textFormat: Text.PlainText
             color: Qt.darker(Color.foreground, 1.8)
             font.family: Style.font.family
@@ -327,7 +337,7 @@ Panel {
               required property int index
               width: recList.width
               height: Math.max(thumb.height, recText.implicitHeight) + Style.space(16)
-              radius: Style.rounding.small
+              radius: Style.cornerRadius
               color: recCard.index === root.selectedIndex
                 ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
                 : "transparent"
@@ -344,7 +354,7 @@ Panel {
                   id: thumb
                   width: Style.space(128)
                   height: Style.space(72)
-                  radius: Style.rounding.small
+                  radius: Style.cornerRadius
                   clip: true
                   color: Qt.darker(Color.foreground, 2.5)
 
@@ -462,7 +472,7 @@ Panel {
 
               Text {
                 text: root.liveService && root.liveService.interests.length === 0
-                  ? "Set your tags of interest (T), then press F"
+                  ? "Set your tags of interest (E), then press F"
                   : "Press F or click “Find me a video”"
                 textFormat: Text.PlainText
                 color: Qt.darker(Color.foreground, 1.8)
@@ -496,8 +506,12 @@ Panel {
           if (event.key === Qt.Key_Escape) {
             root.editingInterests = false
             event.accepted = true
+            Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            root.commitInterests()
+            event.accepted = true
           }
-          return // let the TextInput handle everything else
+          return
         }
 
         if (event.key === Qt.Key_Escape) {

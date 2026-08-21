@@ -78,7 +78,7 @@ Item {
   Process {
     id: runProcess
     stdout: SplitParser {
-      onReadyData: function(data) {
+      onRead: function(data) {
         root.applyState(Model.parseState(data))
       }
     }
