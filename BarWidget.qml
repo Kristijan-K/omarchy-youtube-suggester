@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
@@ -26,6 +27,10 @@ Panel {
   readonly property bool showingRecent: root.recs.length === 0 && root.recentItems.length > 0
   readonly property bool busy: liveService ? liveService.busy : false
   readonly property string stage: liveService ? liveService.stage : "idle"
+  readonly property string engineScript: {
+    var raw = Qt.resolvedUrl("bin/omarchy-youtube-suggestor").toString()
+    return raw.indexOf("file://") === 0 ? raw.substring(7) : raw
+  }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -88,10 +93,14 @@ Panel {
 
   function commitInterests() {
     console.log("youtube-suggestor: commit draft=" + interestsDraft)
-    if (!root.liveService) return
-    var keywords = interestsDraft.split(",").map(function(k) { return k.trim() }).filter(function(k) { return k.length > 0 })
+    var keywords = interestsDraft.split(",").map(function(k) { return k.trim() }).filter(function(k) { return k.length > 0 }).slice(0, 5)
     console.log("youtube-suggestor: saving keywords=" + JSON.stringify(keywords))
-    root.liveService.saveInterests(keywords.slice(0, 5))
+    if (root.liveService) {
+      root.liveService.saveInterests(keywords)
+    } else {
+      fallbackConfigProcess.command = [root.engineScript, "config", "set", "--interests", keywords.join(",")]
+      fallbackConfigProcess.running = true
+    }
     editingInterests = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -144,19 +153,20 @@ Panel {
 
             Text {
               text: {
-                if (!root.liveService) return "Service unavailable"
-                if (root.liveService.transcribing) {
+                if (root.liveService && root.liveService.transcribing) {
                   var t = root.liveService.transcribingItem
                     ? (root.liveService.transcribingItem.title || "") : ""
                   return "Transcribing" + (t ? ": " + t : "…") + " — you can close this panel"
                 }
                 if (root.liveService && root.liveService.lastError !== "") return root.liveService.lastError
                 if (root.busy) {
-                  var p = Model.progressText(root.liveService.state)
+                  var s = root.liveService ? root.liveService.state : null
+                  var p = s ? Model.progressText(s) : ""
                   return Model.stageLabel(root.stage) + (p ? " (" + p + ")" : "")
                 }
                 var base = Model.stageLabel(root.stage)
-                if (root.liveService.updatedAt !== "") base += " · " + root.liveService.updatedAt
+                if (root.liveService && root.liveService.updatedAt) base += " · " + root.liveService.updatedAt
+                if (!root.liveService) base += " (service starting…)"
                 return base
               }
               textFormat: Text.PlainText
@@ -497,6 +507,19 @@ Panel {
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           horizontalAlignment: Text.AlignHCenter
+        }
+      }
+    }
+
+    Process {
+      id: fallbackConfigProcess
+      stdout: StdioCollector { waitForEnd: true }
+      stderr: StdioCollector { waitForEnd: true }
+      onExited: function(exitCode) {
+        if (exitCode === 0 && root.liveService) root.liveService.loadStatus()
+        else if (exitCode === 0) {
+          // service not ready yet, just log
+          console.log("youtube-suggestor: fallback save done, service will pick it up on next open")
         }
       }
     }
