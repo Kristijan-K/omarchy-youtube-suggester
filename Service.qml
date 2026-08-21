@@ -15,6 +15,7 @@ Item {
   property string detail: state.detail || ""
   property var recommendations: Model.recommendations(state)
   property var interests: Model.interests(state)
+  property var recent: Model.recent(state)
   property int candidatesSeen: state.candidates_seen || 0
   property int transcribed: state.transcribed || 0
   property int watchedCount: state.watched_count || 0
@@ -41,6 +42,15 @@ Item {
     openProcess.command = [engineScript, "open", videoId]
     openProcess.running = true
   }
+
+  function transcribe(videoId) {
+    if (!videoId || transcribeProcess.running) return
+    transcribeProcess.command = [engineScript, "transcribe", videoId]
+    transcribeProcess.running = true
+  }
+
+  readonly property bool transcribing: transcribeProcess.running
+  readonly property var transcribingItem: state.transcribing || null
 
   function saveInterests(keywords) {
     if (configProcess.running) return
@@ -96,6 +106,22 @@ Item {
   Process {
     id: openProcess
     stderr: StdioCollector { waitForEnd: true }
+  }
+
+  Process {
+    id: transcribeProcess
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.loadStatus() // pick up the finished transcript summary
+    }
+  }
+
+  // While a background transcription runs, keep the panel state fresh.
+  Timer {
+    interval: 1500
+    repeat: true
+    running: transcribeProcess.running
+    onTriggered: root.loadStatus()
   }
 
   Process {

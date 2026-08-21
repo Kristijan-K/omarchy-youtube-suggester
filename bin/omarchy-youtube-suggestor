@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 HOME = Path.home()
@@ -45,10 +46,11 @@ DEFAULT_CONFIG = {
     "use_account_history": True,
     "account_history_limit": 200,
     "max_candidates": 15,
-    "recommend_count": 5,
+    "metadata_workers": 4,
+    "recommend_count": 3,
+    "transcribe_whisper": True,
     "whisper_model": "base.en",
     "max_whisper_minutes": 20,
-    "max_whisper_per_run": 3,
     "subs_langs": ["en", "en-US", "en-GB"],
 }
 
@@ -285,6 +287,22 @@ def save_seen(seen):
     atomic_write_json(SEEN_FILE, {"ids": sorted(seen)})
 
 
+RECENT_FILE = CACHE_DIR / "recent.json"
+RECENT_LIMIT = 5
+
+
+def load_recent():
+    data = load_json(RECENT_FILE, {})
+    return data.get("videos", [])
+
+
+def remember_recent(video):
+    """Track the last videos opened through the plugin (newest first)."""
+    videos = [v for v in load_recent() if v.get("id") != video.get("id")]
+    videos.insert(0, video)
+    atomic_write_json(RECENT_FILE, {"videos": videos[:RECENT_LIMIT]})
+
+
 def new_state(stage="idle", **extra):
     state = {
         "stage": stage,
@@ -292,6 +310,7 @@ def new_state(stage="idle", **extra):
         "progress": {"done": 0, "total": 0},
         "interests": [],
         "recommendations": [],
+        "recent": [],
         "candidates_seen": 0,
         "transcribed": 0,
         "watched_count": 0,
@@ -477,6 +496,78 @@ def fetch_feed(cfg):
 
 
 # ---------------------------------------------------------------------------
+# metadata (tags/description) fetching + scoring
+
+
+def fetch_metadata(cfg, video_id):
+    """Fetch one video's metadata JSON (tags, description, …) — no download."""
+    cmd = [
+        "yt-dlp",
+        *cookie_args(cfg.get("browser")),
+        "--skip-download",
+        "--no-warnings",
+        "--quiet",
+        "--dump-json",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return None
+
+
+def score_metadata(title, tags, description, keywords):
+    """Score a video's metadata against interest keywords.
+
+    Tags weigh most (explicit creator intent), then title, then description.
+    """
+    total = 0
+    matched = []
+    title_lower = (title or "").lower()
+    tags_lower = " ".join(tags or []).lower()
+    desc_lower = (description or "").lower()
+    for kw in keywords:
+        kw = kw.strip()
+        if not kw:
+            continue
+        pat = keyword_pattern(kw)
+        th = len(pat.findall(title_lower))
+        gh = len(pat.findall(tags_lower))
+        dh = len(pat.findall(desc_lower))
+        if th or gh or dh:
+            matched.append(kw)
+            total += 3 * th + 4 * min(gh, 10) + dh
+    return total, matched
+
+
+def snippet(text, keywords, max_chars=320):
+    """First keyword-relevant part of a description, else its opening."""
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    lower = text.lower()
+    best = -1
+    for kw in keywords:
+        kw = kw.strip()
+        if not kw:
+            continue
+        m = keyword_pattern(kw).search(lower)
+        if m and (best == -1 or m.start() < best):
+            best = m.start()
+    start = max(0, best - 80) if best >= 0 else 0
+    cut = text[start:start + max_chars]
+    if len(text) > start + max_chars:
+        cut = cut.rsplit(" ", 1)[0] + "…"
+    return ("…" + cut) if start > 0 else cut
+
+
+# ---------------------------------------------------------------------------
 # transcription
 
 
@@ -591,24 +682,6 @@ def keyword_pattern(kw):
     return re.compile(r"\b" + re.escape(kw.strip()) + r"\b", re.IGNORECASE)
 
 
-def score_video(title, transcript, keywords):
-    total = 0
-    matched = []
-    title_lower = title.lower()
-    body_lower = transcript.lower()
-    for kw in keywords:
-        kw = kw.strip()
-        if not kw:
-            continue
-        pat = keyword_pattern(kw)
-        th = len(pat.findall(title_lower))
-        bh = len(pat.findall(body_lower))
-        if th or bh:
-            matched.append(kw)
-            total += 3 * th + min(bh, 40)
-    return total, matched
-
-
 def split_sentences(text):
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
@@ -648,7 +721,7 @@ def run_pipeline(limit=None):
     cfg = load_config()
     interests = [k for k in cfg.get("interests", []) if k.strip()]
     limit = limit or cfg.get("max_candidates", 15)
-    recommend_count = cfg.get("recommend_count", 5)
+    recommend_count = cfg.get("recommend_count", 3)
 
     state = new_state(stage="history", interests=interests)
     publish_state(state)
@@ -670,78 +743,74 @@ def run_pipeline(limit=None):
 
     fresh = [e for e in entries if e["id"] not in watched]
     candidates = fresh[:limit]
-    state = dict(
-        state,
-        stage="transcribing",
-        detail="Starting transcription…",
-        candidates_seen=len(entries),
-        progress={"done": 0, "total": len(candidates)},
-    )
-    publish_state(state)
 
-    results = []
-    whisper_budget = int(cfg.get("max_whisper_per_run", 3))
-    for idx, entry in enumerate(candidates):
-        label = f"{entry['channel']} — {entry['title']}"
-        state = dict(
-            state,
-            detail=label,
-            progress={"done": idx, "total": len(candidates)},
-        )
-        publish_state(state)
+    # Phase A: score metadata (title/tags/description) concurrently —
+    # no downloads, no transcription. Transcription is opt-in per video.
+    def _meta_job(entry):
+        try:
+            meta = fetch_metadata(cfg, entry["id"])
+        except Exception:
+            meta = None
+        return entry, meta
 
-        transcript = source = None
-        with tempfile.TemporaryDirectory(prefix="yt-sugg-") as td:
-            workdir = Path(td)
-            try:
-                transcript, source = fetch_captions(cfg, entry["id"], workdir)
-            except Exception:
-                pass
-            if (
-                not transcript
-                and whisper_budget > 0
-                and entry.get("duration", 0)
-                <= cfg.get("max_whisper_minutes", 20) * 60
-            ):
-                try:
-                    transcript, source = fetch_whisper(cfg, entry["id"], workdir)
-                    if source == "whisper":
-                        whisper_budget -= 1
-                except Exception:
-                    pass
-
-        score, matched = score_video(entry["title"], transcript or "", interests)
-        results.append(
-            {
+    scored = [None] * len(candidates)
+    completed = 0
+    workers = max(1, int(cfg.get("metadata_workers", 4)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {pool.submit(_meta_job, e): i for i, e in enumerate(candidates)}
+        for fut in as_completed(future_map):
+            entry, meta = fut.result()
+            tags = (meta or {}).get("tags") or []
+            description = (meta or {}).get("description") or ""
+            score, matched = score_metadata(
+                entry["title"], tags, description, interests
+            )
+            scored[future_map[fut]] = {
                 **entry,
                 "duration_formatted": format_duration(entry.get("duration")),
                 "score": score,
                 "matched": matched,
-                "description": describe(transcript or "", interests)
-                or "Transcript unavailable — ranked by title match only.",
-                "transcript_source": source or "none",
+                "meta_description": description,
+                "tags": tags[:12],
                 "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
                 "url": f"https://www.youtube.com/watch?v={entry['id']}",
+                "transcript_source": "none",
+                "transcript_status": "idle",
+                "description": "",
             }
+            completed += 1
+            state = dict(
+                state,
+                stage="metadata",
+                detail=entry["title"],
+                progress={"done": completed, "total": len(candidates)},
+                candidates_seen=len(entries),
+            )
+            publish_state(state)
+
+    ranked = sorted(scored, key=lambda r: (-r["score"], -r.get("views", 0)))
+    top = ranked[:recommend_count]
+    if top and all(r["score"] == 0 for r in top):
+        # Nothing matched the keywords: fall back to the most-viewed recent
+        # uploads so the panel still has something useful to show.
+        top = sorted(ranked, key=lambda r: -r.get("views", 0))[:recommend_count]
+
+    # Descriptions come from the video's own metadata; transcripts are
+    # fetched lazily per video via `transcribe <id>` on user request.
+    for item in top:
+        item["description"] = (
+            snippet(item["meta_description"], interests)
+            or "No description available. Press T to transcribe."
         )
-
-    state = dict(state, stage="ranking", detail="Scoring against your interests…")
-    publish_state(state)
-
-    scored = sorted(results, key=lambda r: (-r["score"], -r.get("views", 0)))
-    top = scored[:recommend_count]
-    # Backfill with unranked-but-recent videos so the list is never empty.
-    if len(top) < recommend_count:
-        rest = [r for r in scored if r not in top]
-        top += rest[: recommend_count - len(top)]
 
     state = new_state(
         stage="done",
         detail=f"{len(top)} recommendations ready",
         interests=interests,
         recommendations=top,
+        recent=load_recent(),
         candidates_seen=len(entries),
-        transcribed=sum(1 for r in results if r["transcript_source"] != "none"),
+        transcribed=sum(1 for r in top if r["transcript_source"] != "none"),
         watched_count=len(watched),
     )
     publish_state(state)
@@ -752,7 +821,9 @@ def run_pipeline(limit=None):
 
 
 def cmd_status(_args):
-    print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+    state = load_json(STATE_FILE, new_state())
+    state.setdefault("recent", load_recent())
+    print(json.dumps(state), flush=True)
 
 
 def cmd_watch(_args):
@@ -771,12 +842,101 @@ def cmd_watch(_args):
         time.sleep(1.5)
 
 
+def cmd_transcribe(args):
+    """Transcribe one recommended video on user request (background job).
+
+    Updates the state file when finished and fires a desktop notification so
+    the user knows the summary is ready without keeping the panel open.
+    """
+    vid = args.video_id
+    cfg = load_config()
+    interests = [k for k in cfg.get("interests", []) if k.strip()]
+
+    state = load_json(STATE_FILE, {})
+    target = None
+    for item in state.get("recommendations") or []:
+        if isinstance(item, dict) and item.get("id") == vid:
+            target = item
+            break
+    if target is None:
+        print(json.dumps({"error": "video not in current recommendations"}), flush=True)
+        return
+
+    target["transcript_status"] = "working"
+    state["transcribing"] = {"id": vid, "title": target.get("title") or ""}
+    atomic_write_json(STATE_FILE, state)
+
+    transcript = source = None
+    with tempfile.TemporaryDirectory(prefix="yt-sugg-") as td:
+        workdir = Path(td)
+        try:
+            transcript, source = fetch_captions(cfg, vid, workdir)
+        except Exception:
+            pass
+        if (
+            not transcript
+            and cfg.get("transcribe_whisper", True)
+            and (target.get("duration") or 0) <= cfg.get("max_whisper_minutes", 20) * 60
+        ):
+            try:
+                transcript, source = fetch_whisper(cfg, vid, workdir)
+            except Exception:
+                pass
+
+    title = (target.get("title") or vid)[:60]
+    if transcript:
+        target["description"] = describe(transcript, interests)
+        target["transcript_source"] = source
+        target["transcript_status"] = "ready"
+        note = f"Summary ready: {title}"
+    else:
+        target["transcript_status"] = "unavailable"
+        note = f"No usable transcript: {title}"
+
+    state["transcribing"] = None
+    atomic_write_json(STATE_FILE, state)
+
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "YouTube Suggestor", "YouTube Suggestor", note],
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        pass
+    print(json.dumps({"id": vid, "status": target["transcript_status"]}), flush=True)
+
+
 def cmd_open(args):
     vid = args.video_id
     seen = load_seen()
     seen.add(vid)
     save_seen(seen)
     url = f"https://www.youtube.com/watch?v={vid}"
+
+    state = load_json(STATE_FILE, {})
+    info = {}
+    for pool in (state.get("recommendations") or [], state.get("recent") or []):
+        for item in pool:
+            if isinstance(item, dict) and item.get("id") == vid:
+                info = item
+                break
+    entry = {
+        "id": vid,
+        "title": info.get("title") or "(untitled)",
+        "channel": info.get("channel") or "YouTube",
+        "duration_formatted": info.get("duration_formatted") or "?",
+        "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+        "url": url,
+        "opened_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    remember_recent(entry)
+
+    # Keep the published state's recent list in sync for the UI.
+    if state:
+        state["recent"] = load_recent()
+        atomic_write_json(STATE_FILE, state)
+
     webbrowser.open(url)
     print(json.dumps({"opened": vid, "url": url}), flush=True)
 
@@ -839,6 +999,12 @@ def main():
     p_open = sub.add_parser("open", help="Open a video and mark it watched")
     p_open.add_argument("video_id")
     p_open.set_defaults(func=cmd_open)
+
+    p_tr = sub.add_parser(
+        "transcribe", help="Transcribe one recommended video (background job)"
+    )
+    p_tr.add_argument("video_id")
+    p_tr.set_defaults(func=cmd_transcribe)
 
     p_cfg = sub.add_parser("config", help="Get or set configuration")
     p_cfg.add_argument("action", choices=["get", "set"])

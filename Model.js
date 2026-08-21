@@ -4,9 +4,10 @@
 function stageLabel(stage) {
   switch (stage) {
     case "idle": return "Idle"
-    case "history": return "Reading browser history…"
+    case "history": return "Reading watch history…"
     case "feed": return "Fetching subscriptions feed…"
-    case "transcribing": return "Transcribing videos…"
+    case "metadata": return "Scoring video tags…"
+    case "enriching": return "Building descriptions…"
     case "ranking": return "Ranking against your interests…"
     case "done": return "Recommendations ready"
     case "error": return "Error"
@@ -15,7 +16,7 @@ function stageLabel(stage) {
 }
 
 function isBusy(stage) {
-  return stage === "history" || stage === "feed" || stage === "transcribing" || stage === "ranking"
+  return stage === "history" || stage === "feed" || stage === "metadata" || stage === "enriching" || stage === "ranking"
 }
 
 function parseState(text) {
@@ -30,6 +31,10 @@ function parseState(text) {
 
 function recommendations(state) {
   return state && Array.isArray(state.recommendations) ? state.recommendations : []
+}
+
+function recent(state) {
+  return state && Array.isArray(state.recent) ? state.recent : []
 }
 
 function interests(state) {
@@ -65,5 +70,14 @@ function sourceLabel(item) {
     case "captions": return "captions"
     case "whisper": return "whisper"
     default: return "no transcript"
+  }
+}
+
+function transcriptBadge(item) {
+  switch (item ? item.transcript_status : "") {
+    case "working": return "◌ transcribing…"
+    case "ready": return "✓ summary ready"
+    case "unavailable": return "no usable transcript"
+    default: return ""
   }
 }

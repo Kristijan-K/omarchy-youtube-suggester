@@ -21,6 +21,9 @@ Panel {
   readonly property string pluginId: manifest && manifest.id ? manifest.id : "io.github.kkosu.youtube-suggestor"
   readonly property var liveService: service || (bar && bar.shell ? bar.shell.serviceFor(pluginId) : null)
   readonly property var recs: liveService ? liveService.recommendations : []
+  readonly property var recentItems: liveService ? (liveService.recent || []) : []
+  readonly property var listModel: root.recs.length > 0 ? root.recs : root.recentItems
+  readonly property bool showingRecent: root.recs.length === 0 && root.recentItems.length > 0
   readonly property bool busy: liveService ? liveService.busy : false
   readonly property string stage: liveService ? liveService.stage : "idle"
 
@@ -53,6 +56,7 @@ Panel {
   onOpenedChanged: if (opened) {
     selectedIndex = 0
     editingInterests = false
+    if (liveService) liveService.loadStatus() // pick up finished transcripts
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -136,6 +140,11 @@ Panel {
             Text {
               text: {
                 if (!root.liveService) return "Service unavailable"
+                if (root.liveService.transcribing) {
+                  var t = root.liveService.transcribingItem
+                    ? (root.liveService.transcribingItem.title || "") : ""
+                  return "Transcribing" + (t ? ": " + t : "…") + " — you can close this panel"
+                }
                 if (root.lastError !== "") return root.lastError
                 if (root.busy) {
                   var p = Model.progressText(root.liveService.state)
@@ -162,6 +171,42 @@ Panel {
           from: 0
           to: 1
           value: root.liveService ? Model.progressFraction(root.liveService.state) : 0
+        }
+
+        // Find-me-a-video action button (manual trigger only)
+        Rectangle {
+          id: findButton
+          Layout.fillWidth: true
+          implicitHeight: findLabel.implicitHeight + Style.space(14)
+          radius: Style.rounding.small
+          color: !root.liveService || root.busy
+            ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.06)
+            : findMouse.containsPress
+              ? Color.accent
+              : findMouse.containsMouse
+                ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.28)
+                : Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.15)
+
+          Text {
+            id: findLabel
+            anchors.centerIn: parent
+            text: root.busy
+              ? Model.stageLabel(root.stage) + "…"
+              : "󰍉  Find me a video   [F]"
+            textFormat: Text.PlainText
+            color: root.busy ? Qt.darker(Color.foreground, 1.6) : Color.accent
+            font.family: Style.font.family
+            font.bold: true
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          MouseArea {
+            id: findMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: root.liveService && !root.busy
+            onClicked: root.liveService.refresh()
+          }
         }
 
         // Interests row / editor
@@ -208,7 +253,7 @@ Panel {
 
             Text {
               visible: (root.liveService ? root.liveService.interests.length : 0) === 0
-              text: "none set — press E to add up to 5 keywords"
+              text: "none set — press T to add up to 5 keywords"
               textFormat: Text.PlainText
               color: Qt.darker(Color.foreground, 1.8)
               font.family: Style.font.family
@@ -237,7 +282,7 @@ Panel {
 
           Text {
             visible: !root.editingInterests
-            text: "[E] edit"
+            text: "[T] edit"
             textFormat: Text.PlainText
             color: Qt.darker(Color.foreground, 1.8)
             font.family: Style.font.family
@@ -245,19 +290,36 @@ Panel {
           }
         }
 
-        // Recommendations list
-        Item {
+        // Recommendations / recently-opened list
+        ColumnLayout {
           Layout.fillWidth: true
           Layout.fillHeight: true
+          spacing: Style.space(6)
 
-          ListView {
-            id: recList
-            anchors.fill: parent
-            clip: true
-            spacing: Style.space(10)
-            model: root.recs
-            visible: root.recs.length > 0
-            currentIndex: root.selectedIndex
+          Text {
+            visible: root.listModel.length > 0
+            text: root.showingRecent
+              ? "Recently opened"
+              : "Top " + root.recs.length + " for you"
+            textFormat: Text.PlainText
+            color: Qt.darker(Color.foreground, 1.5)
+            font.family: Style.font.family
+            font.bold: true
+            font.pixelSize: Style.font.caption
+          }
+
+          Item {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+
+            ListView {
+              id: recList
+              anchors.fill: parent
+              clip: true
+              spacing: Style.space(10)
+              model: root.listModel
+              visible: root.listModel.length > 0
+              currentIndex: root.selectedIndex
 
             delegate: Rectangle {
               id: recCard
@@ -321,7 +383,9 @@ Panel {
                   }
 
                   Text {
-                    text: recCard.modelData.channel + " · " + recCard.modelData.duration_formatted + " · " + Model.sourceLabel(recCard.modelData)
+                    text: root.showingRecent
+                      ? (recCard.modelData.channel + " · opened " + (recCard.modelData.opened_at || ""))
+                      : (recCard.modelData.channel + " · " + recCard.modelData.duration_formatted + " · " + Model.sourceLabel(recCard.modelData))
                     textFormat: Text.PlainText
                     color: Qt.darker(Color.foreground, 1.5)
                     font.family: Style.font.family
@@ -331,8 +395,9 @@ Panel {
                   }
 
                   Text {
-                    text: recCard.modelData.description
+                    text: recCard.modelData.description || ""
                     textFormat: Text.PlainText
+                    visible: text !== ""
                     color: Qt.darker(Color.foreground, 1.4)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
@@ -343,12 +408,22 @@ Panel {
                   }
 
                   Text {
-                    text: Model.scoreBadge(recCard.modelData)
+                    text: {
+                      if (root.showingRecent) return ""
+                      var parts = []
+                      var sb = Model.scoreBadge(recCard.modelData)
+                      if (sb !== "no keyword match") parts.push(sb)
+                      var tb = Model.transcriptBadge(recCard.modelData)
+                      if (tb !== "") parts.push(tb)
+                      return parts.join(" · ")
+                    }
                     textFormat: Text.PlainText
                     visible: text !== ""
-                    color: Model.matchedItem(recCard.modelData) ? Color.accent : Qt.darker(Color.foreground, 1.8)
+                    color: !root.showingRecent && recCard.modelData.transcript_status === "ready"
+                      ? Color.accent
+                      : (Model.matchedItem(recCard.modelData) ? Color.accent : Qt.darker(Color.foreground, 1.8))
                     font.family: Style.font.family
-                    font.bold: Model.matchedItem(recCard.modelData)
+                    font.bold: !root.showingRecent && (recCard.modelData.transcript_status === "ready" || Model.matchedItem(recCard.modelData))
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
                     Layout.fillWidth: true
@@ -370,30 +445,31 @@ Panel {
             ScrollBar.vertical: ScrollBar {}
           }
 
-          // Empty state
-          ColumnLayout {
-            anchors.centerIn: parent
-            visible: root.recs.length === 0
-            spacing: Style.space(8)
+            // Empty state
+            ColumnLayout {
+              anchors.centerIn: parent
+              visible: root.listModel.length === 0 && !root.busy
+              spacing: Style.space(8)
 
-            Text {
-              text: root.busy ? Model.stageLabel(root.stage) : "No recommendations yet"
-              textFormat: Text.PlainText
-              color: Qt.darker(Color.foreground, 1.5)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.body
-              Layout.alignment: Qt.AlignHCenter
-            }
+              Text {
+                text: "No recommendations yet"
+                textFormat: Text.PlainText
+                color: Qt.darker(Color.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+                Layout.alignment: Qt.AlignHCenter
+              }
 
-            Text {
-              text: root.busy
-                ? (root.liveService ? (root.liveService.detail || "") : "")
-                : "Set your interests (E), then press R to scan your feed"
-              textFormat: Text.PlainText
-              color: Qt.darker(Color.foreground, 1.8)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              Layout.alignment: Qt.AlignHCenter
+              Text {
+                text: root.liveService && root.liveService.interests.length === 0
+                  ? "Set your tags of interest (T), then press F"
+                  : "Press F or click “Find me a video”"
+                textFormat: Text.PlainText
+                color: Qt.darker(Color.foreground, 1.8)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                Layout.alignment: Qt.AlignHCenter
+              }
             }
           }
         }
@@ -401,7 +477,7 @@ Panel {
         // Footer keybindings bar
         Text {
           Layout.fillWidth: true
-          text: "j / k navigate    o / Enter open    R rescan feed    E edit interests    Esc close"
+          text: "F find me a video    T transcribe selected    E edit tags    o / Enter open    j / k navigate    Esc close"
           textFormat: Text.PlainText
           color: Qt.darker(Color.foreground, 1.5)
           font.family: Style.font.family
@@ -427,8 +503,19 @@ Panel {
         if (event.key === Qt.Key_Escape) {
           root.close()
           event.accepted = true
+        } else if (event.text === "f" || event.text === "F") {
+          if (root.liveService && !root.liveService.busy) root.liveService.refresh()
+          event.accepted = true
         } else if (event.text === "r" || event.text === "R") {
           if (root.liveService && !root.liveService.busy) root.liveService.refresh()
+          event.accepted = true
+        } else if (event.text === "t" || event.text === "T") {
+          if (root.liveService && root.recs.length > 0 && selectedIndex < root.recs.length) {
+            var sel = root.recs[selectedIndex]
+            if (sel.transcript_status !== "ready" && sel.transcript_status !== "working") {
+              root.liveService.transcribe(sel.id)
+            }
+          }
           event.accepted = true
         } else if (event.text === "e" || event.text === "E") {
           root.startEditingInterests()

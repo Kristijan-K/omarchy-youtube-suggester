@@ -1,10 +1,10 @@
 # YouTube Suggestor — Omarchy Quattro Plugin
 
 A native Omarchy Quattro bar plugin that scans your logged-in YouTube
-subscriptions feed, filters out videos you have already watched, transcribes
-the newest unwatched uploads, and recommends the **top 5** that best match
-your interest keywords — each with a short "what it's about" description
-generated from the actual transcript.
+subscriptions feed, filters out videos you have already watched, and
+recommends the **top 3** matches for your interest keywords — scored against
+real video metadata (title, creator tags, description) in seconds, with
+on-demand transcript summaries one keypress away.
 
 ![YouTube Suggestor preview](preview.png)
 
@@ -20,27 +20,33 @@ generated from the actual transcript.
    cookie database itself (including the new v11 hash-prefix scheme that
    yt-dlp cannot read yet) into a temporary `cookies.txt`; it falls back to
    `--cookies-from-browser` elsewhere.
-3. **Transcription** — for each unwatched candidate (newest 15 by default):
-   existing captions are used when available (seconds per video); otherwise
-   the audio is downloaded and transcribed locally with `whisper` (bounded by
-   `max_whisper_per_run` so a scan never runs forever). Music/silence
-   transcripts are detected and discarded.
-4. **Ranking** — transcripts are scored against your 1–5 interest keywords
-   (title matches weigh 3×, transcript matches 1×), and the top 5 videos are
-   shown with keyword badges and an extractive summary of what was said.
+3. **Metadata scoring** — each unwatched candidate's title, creator tags, and
+   description are scored against your keywords (tags weigh most, then
+   title, then description). Nothing is downloaded or transcribed; a full
+   scan takes ~30 seconds.
+4. **On-demand transcripts** — press `T` on any recommendation to transcribe
+   it in the background (captions first, whisper fallback). The panel can be
+   closed; when the summary is ready a desktop notification fires and the
+   card shows "✓ summary ready" next time you open it.
+
+Nothing runs automatically — the pipeline only starts when you press `F` or
+click **Find me a video**.
 
 ## Features
 
-- Bar widget showing pipeline status at a glance; middle-click rescans.
-- Panel lists the top 5 recommendations with thumbnails, channel, duration,
-  transcript source, relevance score, matched keywords, and description.
-- Inline interest editor (`E`) — up to 5 comma-separated keywords, persisted
-  in `~/.config/youtube-suggestor/config.json`.
-- Live progress while scanning (history → feed → transcribing → ranking).
+- Bar widget (middle-click rescans); nothing runs until you ask.
+- Panel opens showing your recently opened videos, ready for a fresh scan.
+- **Find me a video** button / `F` key runs the whole pipeline live.
+- Top 3 recommendations with thumbnails, channel, duration, keyword badges,
+  and descriptions from the video's own metadata.
+- `T` transcribes the selected video in the background with a spinner badge
+  and a "summary ready" desktop notification.
+- Inline tags editor (`E`) — up to 5 comma-separated keywords, persisted in
+  `~/.config/youtube-suggestor/config.json`.
 - Opens videos in your default browser (`o` / `Enter`) and remembers them as
   watched so they never appear again.
-- Fully keyboard-driven: `j/k` navigate, `R` rescan, `E` edit interests,
-  `Esc` close.
+- Fully keyboard-driven: `F` find, `T` transcribe, `E` edit tags,
+  `o/Enter` open, `j/k` navigate, `Esc` close.
 
 ## Requirements
 
@@ -82,10 +88,11 @@ omarchy bar put "$PLUGIN_ID" --section right
 
 1. Click the bar icon and press `E`, type up to 5 keywords
    (e.g. `linux, hyprland, salesforce, keyboards`), press `Enter`.
-2. Press `R`. The pipeline runs: browser history → subscriptions feed →
-   transcription → ranking. Progress is streamed live in the panel.
-3. Browse the top 5, press `o` to watch one — it is marked watched
-   automatically.
+2. Press `F` (or click **Find me a video**). Watch the live progress:
+   watch history → feed → metadata scoring. Done in ~30 seconds.
+3. Browse the top 3, press `o` to watch one — it is marked watched
+   automatically. Want a deeper summary of one? Press `T` and carry on;
+   a notification tells you when its transcript summary is ready.
 
 If your YouTube login lives in a different browser, set it once:
 
@@ -98,15 +105,16 @@ If your YouTube login lives in a different browser, set it once:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `interests` | `[]` | 1–5 keywords scored against titles and transcripts |
+| `interests` | `[]` | 1–5 keywords scored against titles, tags, descriptions |
 | `browser` | `chromium` | Cookie source: `chromium`, `chrome`, `brave`, `edge`, `firefox` |
 | `feed_limit` | `120` | How many subscription-feed entries to pull per scan |
-| `max_candidates` | `15` | Newest unwatched videos to transcribe per scan |
-| `recommend_count` | `5` | Recommendations shown |
+| `max_candidates` | `15` | Newest unwatched videos to score per scan |
+| `metadata_workers` | `4` | Parallel metadata fetches (scan speed) |
+| `recommend_count` | `3` | Recommendations shown |
 | `use_account_history` | `true` | Also fetch account watch history (other-device views) |
 | `account_history_limit` | `200` | Account history entries to consider |
+| `transcribe_whisper` | `true` | Allow whisper fallback for on-demand `T` transcriptions |
 | `max_whisper_minutes` | `20` | Only whisper-transcribe videos shorter than this |
-| `max_whisper_per_run` | `3` | Cap local whisper jobs per scan |
 | `whisper_model` | `base.en` | Whisper model used for the fallback |
 | `subs_langs` | `en…` | Caption languages to accept |
 
@@ -119,13 +127,15 @@ CLI="$HOME/.config/omarchy/plugins/io.github.kkosu.youtube-suggestor/bin/omarchy
 "$CLI" config set --interests "linux,nix,salesforce"
 "$CLI" run                        # full pipeline, streams progress JSON lines
 "$CLI" status                     # current state JSON
+"$CLI" transcribe <video_id>      # background transcript summary + notification
 "$CLI" feed                       # debug: show fetched feed candidates
 "$CLI" history                    # debug: count watched IDs found in browsers
 "$CLI" open <video_id>            # mark watched + open in browser
 ```
 
 State lives in `~/.cache/omarchy/youtube-suggestor/state.json`; seen-video
-marks in `seen.json` next to it.
+marks in `seen.json` and the panel's "Recently opened" list in `recent.json`
+next to it.
 
 ## Troubleshooting
 

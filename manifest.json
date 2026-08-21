@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Kristijan K",
   "license": "MIT",
-  "description": "Scans your YouTube subscriptions feed, transcribes unwatched videos, and recommends the top 5 matching your interest keywords.",
+  "description": "Scans your YouTube subscriptions feed, scores unwatched videos against your interest keywords using video metadata, and recommends the top 3 with on-demand transcript summaries.",
   "kinds": ["service", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {
