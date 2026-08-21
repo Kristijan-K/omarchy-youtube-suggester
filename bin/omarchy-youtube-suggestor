@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""YouTube Suggestor engine for the Omarchy Quattro plugin.
+
+Pipeline:
+  1. Build the watched set from local browser history (Firefox/Chrome family)
+     plus videos previously opened through this plugin.
+  2. Fetch the logged-in YouTube subscriptions feed via yt-dlp with browser
+     cookies.
+  3. Filter out watched videos, keep the newest N candidates.
+  4. Transcribe each candidate: existing captions first (fast), falling back
+     to downloading audio and transcribing locally with whisper.
+  5. Score transcripts against the user's interest keywords and pick the top
+     recommendations with an extractive "what it's about" description.
+
+Every state change is written atomically to the state file and printed as a
+single JSON line, so the QML service can stream live progress.
+"""
+
+import argparse
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "youtube-suggestor"
+CACHE_DIR = HOME / ".cache" / "omarchy" / "youtube-suggestor"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_FILE = CACHE_DIR / "state.json"
+SEEN_FILE = CACHE_DIR / "seen.json"
+
+DEFAULT_CONFIG = {
+    "interests": [],
+    "browser": "chromium",
+    "feed_limit": 120,
+    "use_account_history": True,
+    "account_history_limit": 200,
+    "max_candidates": 15,
+    "recommend_count": 5,
+    "whisper_model": "base.en",
+    "max_whisper_minutes": 20,
+    "max_whisper_per_run": 3,
+    "subs_langs": ["en", "en-US", "en-GB"],
+}
+
+WATCH_PATTERNS = ("%youtube.com/watch%", "%youtu.be/%", "%youtube.com/shorts%")
+
+# Chromium-family cookie decryption support.
+# Chromium >= ~137 writes v11 cookies on Linux whose plaintext carries a
+# 32-byte SHA-256 hash prefix; the AES key is derived (PBKDF2-SHA1,
+# salt "saltysalt", 1 iteration, 16 bytes) from the browser's "Safe Storage"
+# secret held in the desktop keyring. yt-dlp does not strip that prefix on
+# Linux yet, so we decrypt the cookie database ourselves and hand yt-dlp a
+# Netscape cookies.txt file instead.
+try:
+    from Cryptodome.Cipher import AES as _AES
+except ImportError:  # pragma: no cover
+    try:
+        from Crypto.Cipher import AES as _AES
+    except ImportError:
+        _AES = None
+
+CHROMIUM_BROWSERS = {
+    "chromium": {
+        "roots": [HOME / ".config" / "chromium"],
+        "label": "Chromium",
+        "app": "chromium",
+    },
+    "chrome": {
+        "roots": [HOME / ".config" / "google-chrome"],
+        "label": "Chrome",
+        "app": "Chrome",
+    },
+    "brave": {
+        "roots": [HOME / ".config" / "BraveSoftware" / "Brave-Browser"],
+        "label": "Brave",
+        "app": "brave",
+    },
+    "edge": {
+        "roots": [HOME / ".config" / "microsoft-edge"],
+        "label": "Microsoft Edge",
+        "app": "Microsoft Edge",
+    },
+}
+
+COOKIES_FILE = CACHE_DIR / "cookies.txt"
+
+
+def _pbkdf2_key(password, length=16):
+    return hashlib.pbkdf2_hmac("sha1", password, b"saltysalt", 1, dklen=length)
+
+
+def _keyring_safe_storage_secret(browser):
+    """Fetch the browser's Safe Storage secret from the desktop keyring."""
+    info = CHROMIUM_BROWSERS.get(browser)
+    if not info:
+        return None
+    try:
+        import secretstorage
+
+        con = secretstorage.dbus_init()
+        col = secretstorage.get_default_collection(con)
+        want_label = info["label"] + " Safe Storage"
+        want_app = info["app"].lower()
+        for item in col.get_all_items():
+            if item.get_label() != want_label:
+                continue
+            attrs = item.get_attributes()
+            if str(attrs.get("application", "")).lower() == want_app:
+                return item.get_secret()
+    except Exception:
+        pass
+    return None
+
+
+def _find_browser_cookie_db(browser):
+    info = CHROMIUM_BROWSERS.get(browser)
+    if not info:
+        return None
+    candidates = []
+    for root in info["roots"]:
+        if not root.is_dir():
+            continue
+        candidates.extend(root.glob("*/Cookies"))
+    if not candidates:
+        return None
+    # Prefer Default, otherwise the most recently used profile.
+    for cand in candidates:
+        if cand.parent.name == "Default":
+            return cand
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _decrypt_chromium_cookie(blob, os_secret):
+    if not blob:
+        return None
+    version, body = blob[:3], blob[3:]
+    if version == b"v10":
+        attempts = [(b"peanuts", False)]
+    elif version == b"v11":
+        attempts = []
+        if os_secret:
+            attempts.append((os_secret, True))
+        attempts.append((b"peanuts", True))
+    else:
+        return None
+    for password, hash_prefix in attempts:
+        try:
+            dec = _AES.new(_pbkdf2_key(password), _AES.MODE_CBC, b" " * 16).decrypt(
+                body
+            )
+            pad = dec[-1]
+            if not (isinstance(pad, int) and 1 <= pad <= 16):
+                continue
+            dec = dec[:-pad]
+            if hash_prefix:
+                if len(dec) <= 32:
+                    continue
+                dec = dec[32:]
+            return dec.decode("utf-8")
+        except Exception:
+            continue
+    return None
+
+
+def _webkit_to_unix(microseconds):
+    if not microseconds:
+        return 0
+    return int(microseconds / 1_000_000 - 11644473600)
+
+
+def export_browser_cookies(browser):
+    """Decrypt the browser cookie DB into a Netscape cookies.txt file.
+
+    Returns the path on success, None when unsupported or nothing usable
+    was decrypted.
+    """
+    if _AES is None or browser not in CHROMIUM_BROWSERS:
+        return None
+    db_path = _find_browser_cookie_db(browser)
+    if not db_path:
+        return None
+    secret = _keyring_safe_storage_secret(browser)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / "Cookies"
+            shutil.copy2(db_path, copy)
+            for sidecar in ("-wal", "-shm"):
+                src = Path(str(db_path) + sidecar)
+                if src.exists():
+                    shutil.copy2(src, Path(str(copy) + sidecar))
+            con = sqlite3.connect(str(copy))
+            try:
+                rows = con.execute(
+                    "SELECT host_key, name, value, encrypted_value, path, "
+                    "expires_utc, is_secure FROM cookies "
+                    "WHERE host_key LIKE '%youtube%' OR host_key LIKE '%google%'"
+                ).fetchall()
+            finally:
+                con.close()
+    except Exception:
+        return None
+
+    lines = ["# Netscape HTTP Cookie File", "# Generated by omarchy-youtube-suggestor"]
+    count = 0
+    for host, name, value, enc, path, expires, secure in rows:
+        if not value:
+            value = _decrypt_chromium_cookie(enc, secret)
+        if not value:
+            continue
+        domain = host if host.startswith(".") else "." + host.lstrip(".")
+        lines.append(
+            "\t".join(
+                [
+                    domain,
+                    "TRUE",
+                    path or "/",
+                    "TRUE" if secure else "FALSE",
+                    str(max(0, _webkit_to_unix(expires))),
+                    name,
+                    value,
+                ]
+            )
+        )
+        count += 1
+    if count < 5:  # a logged-in session always carries many google/youtube cookies
+        return None
+    ensure_dirs()
+    COOKIES_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(COOKIES_FILE, 0o600)
+    return COOKIES_FILE
+
+
+# ---------------------------------------------------------------------------
+# persistence helpers
+
+
+def ensure_dirs():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def atomic_write_json(path, data):
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(load_json(CONFIG_FILE, {}))
+    return cfg
+
+
+def save_config(cfg):
+    ensure_dirs()
+    atomic_write_json(CONFIG_FILE, cfg)
+
+
+def load_seen():
+    data = load_json(SEEN_FILE, {})
+    return set(data.get("ids", []))
+
+
+def save_seen(seen):
+    ensure_dirs()
+    atomic_write_json(SEEN_FILE, {"ids": sorted(seen)})
+
+
+def new_state(stage="idle", **extra):
+    state = {
+        "stage": stage,
+        "detail": "",
+        "progress": {"done": 0, "total": 0},
+        "interests": [],
+        "recommendations": [],
+        "candidates_seen": 0,
+        "transcribed": 0,
+        "watched_count": 0,
+        "error": None,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    state.update(extra)
+    return state
+
+
+def publish_state(state):
+    """Persist and stream the current state."""
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    atomic_write_json(STATE_FILE, state)
+    print(json.dumps(state), flush=True)
+
+
+# ---------------------------------------------------------------------------
+# watched history
+
+
+def video_id_from_url(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", url)
+    return m.group(1) if m else None
+
+
+def collect_browser_history_ids():
+    ids = set()
+    sources = []
+
+    # Firefox profiles
+    firefox_root = HOME / ".mozilla" / "firefox"
+    if firefox_root.is_dir():
+        for places in firefox_root.glob("*/places.sqlite"):
+            sources.append(("firefox", places))
+
+    # Chromium family browsers
+    for name, base in (
+        ("chrome", HOME / ".config" / "google-chrome"),
+        ("chromium", HOME / ".config" / "chromium"),
+        ("brave", HOME / ".config" / "BraveSoftware" / "Brave-Browser"),
+        ("edge", HOME / ".config" / "microsoft-edge"),
+    ):
+        if base.is_dir():
+            for hist in base.glob("*/History"):
+                sources.append((name, hist))
+
+    clause = " OR ".join("url LIKE ?" for _ in WATCH_PATTERNS)
+    query = f"SELECT url FROM urls WHERE {clause}" if True else ""
+    for name, db in sources:
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                copy = Path(td) / db.name
+                shutil.copy2(db, copy)
+                # Copy WAL sidecars when present so recent rows are visible.
+                for sidecar in ("-wal", "-shm"):
+                    src = Path(str(db) + sidecar)
+                    if src.exists():
+                        shutil.copy2(src, Path(str(copy) + sidecar))
+                con = sqlite3.connect(str(copy))
+                try:
+                    cur = con.execute(query, WATCH_PATTERNS)
+                    for (url,) in cur.fetchall():
+                        vid = video_id_from_url(url or "")
+                        if vid:
+                            ids.add(vid)
+                finally:
+                    con.close()
+        except Exception:
+            continue  # unreadable profile: skip silently
+    return ids
+
+
+def fetch_account_history_ids(cfg):
+    """Best-effort: recent watch-history entries from the YouTube account.
+
+    Catches videos watched on other devices; requires working cookies and
+    history being enabled on the account.
+    """
+    limit = int(cfg.get("account_history_limit", 200))
+    cmd = [
+        "yt-dlp",
+        *cookie_args(cfg.get("browser")),
+        "--flat-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--playlist-end",
+        str(limit),
+        "--print",
+        "%(id)s",
+        ":ythistory",
+    ]
+    ids = set()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        for line in proc.stdout.splitlines():
+            vid = line.strip()
+            if re.fullmatch(r"[\w-]{11}", vid):
+                ids.add(vid)
+    except Exception:
+        pass
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# feed fetching (yt-dlp + browser cookies)
+
+
+_COOKIE_ARGS_CACHE = {}
+
+
+def cookie_args(browser):
+    """yt-dlp auth args: our decrypted cookies.txt when possible."""
+    if not browser or browser == "none":
+        return []
+    if browser in _COOKIE_ARGS_CACHE:
+        return _COOKIE_ARGS_CACHE[browser]
+    args = []
+    if _AES is not None:
+        try:
+            exported = export_browser_cookies(browser)
+        except Exception:
+            exported = None
+        if exported:
+            args = ["--cookies", str(exported)]
+    if not args:
+        args = ["--cookies-from-browser", browser]
+    _COOKIE_ARGS_CACHE[browser] = args
+    return args
+
+
+def fetch_feed(cfg):
+    """Return raw entries from the logged-in subscriptions feed."""
+    feed_limit = int(cfg.get("feed_limit", 120))
+    cmd = [
+        "yt-dlp",
+        *cookie_args(cfg.get("browser")),
+        "--flat-playlist",
+        "--no-warnings",
+        "--quiet",
+        "--playlist-end",
+        str(feed_limit),
+        "--dump-json",
+        "https://www.youtube.com/feed/subscriptions",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    entries = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        vid = data.get("id") or ""
+        if not re.fullmatch(r"[\w-]{11}", vid):
+            continue
+
+        def num(value):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return 0
+
+        entries.append(
+            {
+                "id": vid,
+                "title": data.get("title") or "(untitled)",
+                "channel": data.get("channel")
+                or data.get("uploader")
+                or "YouTube",
+                "duration": num(data.get("duration")),
+                "views": num(data.get("view_count")),
+            }
+        )
+    if not entries and proc.returncode != 0:
+        raise RuntimeError(
+            "yt-dlp returned no feed entries: "
+            + (proc.stderr.strip().splitlines() or ["unknown error"])[-1][:200]
+        )
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# transcription
+
+
+def transcript_is_usable(text):
+    """Reject garbage transcripts (music videos, silence) before ranking."""
+    words = text.split()
+    if len(words) < 20:
+        return False
+    unique_ratio = len({w.lower().strip(".,!?\"'") for w in words}) / len(words)
+    return unique_ratio >= 0.15
+
+
+def parse_vtt(text):
+    lines_out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if (
+            not line
+            or line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:"))
+            or "-->" in line
+            or re.fullmatch(r"[\d:.,-]+", line)
+        ):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = html.unescape(line).strip()
+        if line and (not lines_out or lines_out[-1] != line):
+            lines_out.append(line)
+    return " ".join(lines_out)
+
+
+def fetch_captions(cfg, video_id, workdir):
+    """Try to grab existing (auto-generated included) captions via yt-dlp."""
+    langs = ",".join(cfg.get("subs_langs", DEFAULT_CONFIG["subs_langs"]))
+    cmd = [
+        "yt-dlp",
+        *cookie_args(cfg.get("browser")),
+        "--skip-download",
+        "--no-warnings",
+        "--quiet",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs",
+        langs + ",.*-orig",
+        "--sub-format",
+        "vtt/srt/best",
+        "-o",
+        str(workdir / "%(id)s"),
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    for vtt in sorted(workdir.glob(f"{video_id}*.vtt")) + sorted(
+        workdir.glob(f"{video_id}*.srt")
+    ):
+        try:
+            text = parse_vtt(vtt.read_text(encoding="utf-8", errors="replace"))
+            if transcript_is_usable(text):
+                return text, "captions"
+        except OSError:
+            continue
+    return None, None
+
+
+def fetch_whisper(cfg, video_id, workdir):
+    """Download audio and transcribe locally with whisper (fallback)."""
+    if not shutil.which("whisper"):
+        return None, None
+    audio_cmd = [
+        "yt-dlp",
+        *cookie_args(cfg.get("browser")),
+        "--no-warnings",
+        "--quiet",
+        "-f",
+        "bestaudio[abr<=50]/bestaudio",
+        "-x",
+        "--audio-format",
+        "mp3",
+        "--audio-quality",
+        "7",
+        "-o",
+        str(workdir / f"{video_id}.%(ext)s"),
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    subprocess.run(audio_cmd, capture_output=True, text=True, timeout=300)
+    audio_files = list(workdir.glob(f"{video_id}*.mp3"))
+    if not audio_files:
+        return None, None
+    out_dir = workdir / "whisper-out"
+    out_dir.mkdir(exist_ok=True)
+    cmd = [
+        "whisper",
+        "--model",
+        cfg.get("whisper_model", "base.en"),
+        "--output_format",
+        "txt",
+        "--output_dir",
+        str(out_dir),
+        str(audio_files[0]),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    txt_files = list(out_dir.glob("*.txt"))
+    if not txt_files:
+        return None, None
+    text = txt_files[0].read_text(encoding="utf-8", errors="replace").strip()
+    return (text, "whisper") if transcript_is_usable(text) else (None, None)
+
+
+# ---------------------------------------------------------------------------
+# scoring
+
+
+def keyword_pattern(kw):
+    return re.compile(r"\b" + re.escape(kw.strip()) + r"\b", re.IGNORECASE)
+
+
+def score_video(title, transcript, keywords):
+    total = 0
+    matched = []
+    title_lower = title.lower()
+    body_lower = transcript.lower()
+    for kw in keywords:
+        kw = kw.strip()
+        if not kw:
+            continue
+        pat = keyword_pattern(kw)
+        th = len(pat.findall(title_lower))
+        bh = len(pat.findall(body_lower))
+        if th or bh:
+            matched.append(kw)
+            total += 3 * th + min(bh, 40)
+    return total, matched
+
+
+def split_sentences(text):
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def describe(transcript, keywords, max_chars=320):
+    """Extractive summary: the most keyword-relevant sentences, in order."""
+    if not transcript:
+        return ""
+    sentences = split_sentences(transcript)[:400]
+    scored = []
+    for idx, sent in enumerate(sentences):
+        lower = sent.lower()
+        hits = sum(len(keyword_pattern(k).findall(lower)) for k in keywords if k.strip())
+        scored.append((hits, idx, sent))
+    relevant = [s for s in scored if s[0] > 0]
+    pool = relevant if relevant else sorted(scored, key=lambda s: (-len(s[2]), s[1]))[:2]
+    chosen = sorted(pool, key=lambda s: s[1])[:3]
+    summary = " ".join(s[2] for s in chosen)
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rsplit(" ", 1)[0] + "…"
+    return summary
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "?"
+    minutes, sec = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{sec:02d}" if hours else f"{minutes}:{sec:02d}"
+
+
+# ---------------------------------------------------------------------------
+# pipeline
+
+
+def run_pipeline(limit=None):
+    cfg = load_config()
+    interests = [k for k in cfg.get("interests", []) if k.strip()]
+    limit = limit or cfg.get("max_candidates", 15)
+    recommend_count = cfg.get("recommend_count", 5)
+
+    state = new_state(stage="history", interests=interests)
+    publish_state(state)
+
+    watched = collect_browser_history_ids() | load_seen()
+    if cfg.get("use_account_history", True):
+        state = dict(state, detail="Fetching account watch history…")
+        publish_state(state)
+        watched |= fetch_account_history_ids(cfg)
+    state["watched_count"] = len(watched)
+
+    state = dict(state, stage="feed", detail="Fetching subscriptions feed…")
+    publish_state(state)
+    try:
+        entries = fetch_feed(cfg)
+    except Exception as exc:
+        publish_state(new_state(stage="error", error=str(exc), interests=interests))
+        return
+
+    fresh = [e for e in entries if e["id"] not in watched]
+    candidates = fresh[:limit]
+    state = dict(
+        state,
+        stage="transcribing",
+        detail="Starting transcription…",
+        candidates_seen=len(entries),
+        progress={"done": 0, "total": len(candidates)},
+    )
+    publish_state(state)
+
+    results = []
+    whisper_budget = int(cfg.get("max_whisper_per_run", 3))
+    for idx, entry in enumerate(candidates):
+        label = f"{entry['channel']} — {entry['title']}"
+        state = dict(
+            state,
+            detail=label,
+            progress={"done": idx, "total": len(candidates)},
+        )
+        publish_state(state)
+
+        transcript = source = None
+        with tempfile.TemporaryDirectory(prefix="yt-sugg-") as td:
+            workdir = Path(td)
+            try:
+                transcript, source = fetch_captions(cfg, entry["id"], workdir)
+            except Exception:
+                pass
+            if (
+                not transcript
+                and whisper_budget > 0
+                and entry.get("duration", 0)
+                <= cfg.get("max_whisper_minutes", 20) * 60
+            ):
+                try:
+                    transcript, source = fetch_whisper(cfg, entry["id"], workdir)
+                    if source == "whisper":
+                        whisper_budget -= 1
+                except Exception:
+                    pass
+
+        score, matched = score_video(entry["title"], transcript or "", interests)
+        results.append(
+            {
+                **entry,
+                "duration_formatted": format_duration(entry.get("duration")),
+                "score": score,
+                "matched": matched,
+                "description": describe(transcript or "", interests)
+                or "Transcript unavailable — ranked by title match only.",
+                "transcript_source": source or "none",
+                "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
+                "url": f"https://www.youtube.com/watch?v={entry['id']}",
+            }
+        )
+
+    state = dict(state, stage="ranking", detail="Scoring against your interests…")
+    publish_state(state)
+
+    scored = sorted(results, key=lambda r: (-r["score"], -r.get("views", 0)))
+    top = scored[:recommend_count]
+    # Backfill with unranked-but-recent videos so the list is never empty.
+    if len(top) < recommend_count:
+        rest = [r for r in scored if r not in top]
+        top += rest[: recommend_count - len(top)]
+
+    state = new_state(
+        stage="done",
+        detail=f"{len(top)} recommendations ready",
+        interests=interests,
+        recommendations=top,
+        candidates_seen=len(entries),
+        transcribed=sum(1 for r in results if r["transcript_source"] != "none"),
+        watched_count=len(watched),
+    )
+    publish_state(state)
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+
+def cmd_status(_args):
+    print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+
+
+def cmd_watch(_args):
+    """Stream state file changes as JSON lines (used by tooling/debugging)."""
+    ensure_dirs()
+    last_mtime = None
+    print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+    while True:
+        try:
+            mtime = STATE_FILE.stat().st_mtime
+            if mtime != last_mtime:
+                last_mtime = mtime
+                print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+        except OSError:
+            pass
+        time.sleep(1.5)
+
+
+def cmd_open(args):
+    vid = args.video_id
+    seen = load_seen()
+    seen.add(vid)
+    save_seen(seen)
+    url = f"https://www.youtube.com/watch?v={vid}"
+    webbrowser.open(url)
+    print(json.dumps({"opened": vid, "url": url}), flush=True)
+
+
+def cmd_config(args):
+    if args.action == "get":
+        print(json.dumps(load_config()), flush=True)
+        return
+    cfg = load_config()
+    if args.interests is not None:
+        cfg["interests"] = [
+            k.strip() for k in args.interests.split(",") if k.strip()
+        ][:5]
+    if args.browser:
+        cfg["browser"] = args.browser
+    if args.max_candidates:
+        cfg["max_candidates"] = max(1, args.max_candidates)
+    save_config(cfg)
+    print(json.dumps(cfg), flush=True)
+
+
+def cmd_history(_args):
+    ids = collect_browser_history_ids()
+    print(json.dumps({"watched": len(ids), "sample": sorted(ids)[:20]}), flush=True)
+
+
+def cmd_feed(args):
+    cfg = load_config()
+    entries = fetch_feed(cfg)
+    watched = collect_browser_history_ids() | load_seen()
+    fresh = [e for e in entries if e["id"] not in watched]
+    limit = args.limit or cfg.get("max_candidates", 15)
+    print(
+        json.dumps(
+            {
+                "feed_size": len(entries),
+                "unwatched": len(fresh),
+                "candidates": fresh[:limit],
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-youtube-suggestor")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_run = sub.add_parser("run", help="Run the full suggestor pipeline")
+    p_run.add_argument("--limit", type=int, default=None)
+    p_run.set_defaults(func=lambda a: run_pipeline(a.limit))
+
+    p_status = sub.add_parser("status", help="Print current state JSON")
+    p_status.set_defaults(func=cmd_status)
+
+    p_watch = sub.add_parser("watch", help="Stream state changes as JSON lines")
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_open = sub.add_parser("open", help="Open a video and mark it watched")
+    p_open.add_argument("video_id")
+    p_open.set_defaults(func=cmd_open)
+
+    p_cfg = sub.add_parser("config", help="Get or set configuration")
+    p_cfg.add_argument("action", choices=["get", "set"])
+    p_cfg.add_argument("--interests", default=None, help="Comma-separated keywords (max 5)")
+    p_cfg.add_argument("--browser", default=None)
+    p_cfg.add_argument("--max-candidates", type=int, default=None, dest="max_candidates")
+    p_cfg.set_defaults(func=cmd_config)
+
+    p_hist = sub.add_parser("history", help="Rebuild watched set from browsers (debug)")
+    p_hist.set_defaults(func=cmd_history)
+
+    p_feed = sub.add_parser("feed", help="Fetch feed only (debug)")
+    p_feed.add_argument("--limit", type=int, default=None)
+    p_feed.set_defaults(func=cmd_feed)
+
+    args = parser.parse_args()
+    ensure_dirs()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+*.tmp
+preview.png.bak
+__pycache__/

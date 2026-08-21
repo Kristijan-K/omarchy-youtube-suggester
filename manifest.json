@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kkosu.youtube-suggestor",
+  "name": "YouTube Suggestor",
+  "version": "1.0.0",
+  "author": "Kristijan K",
+  "license": "MIT",
+  "description": "Scans your YouTube subscriptions feed, transcribes unwatched videos, and recommends the top 5 matching your interest keywords.",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "YouTube Suggestor",
+    "description": "Top 5 videos from your subscriptions, picked by AI transcription and your interests.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
