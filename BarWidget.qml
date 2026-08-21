@@ -80,13 +80,17 @@ Panel {
     editingInterests = true
     Qt.callLater(function() {
       interestsInput.text = interestsDraft
+      interestsInput.forceActiveFocus()
       interestsInput.cursorPosition = interestsInput.text.length
+      console.log("youtube-suggestor: startEditing draft=" + interestsDraft + " input.text=" + interestsInput.text + " activeFocus=" + interestsInput.activeFocus)
     })
   }
 
   function commitInterests() {
+    console.log("youtube-suggestor: commit draft=" + interestsDraft)
     if (!root.liveService) return
     var keywords = interestsDraft.split(",").map(function(k) { return k.trim() }).filter(function(k) { return k.length > 0 })
+    console.log("youtube-suggestor: saving keywords=" + JSON.stringify(keywords))
     root.liveService.saveInterests(keywords.slice(0, 5))
     editingInterests = false
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
