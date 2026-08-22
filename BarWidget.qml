@@ -72,11 +72,11 @@ Panel {
     fontSize: Style.font.caption
     foreground: root.bar ? root.bar.barForeground : Color.foreground
     tooltipText: {
-      if (!root.liveService) return "YouTube Suggestor"
+      if (!root.liveService) return "YouTube Suggester"
       var count = root.recs.length
       var line = count > 0 ? (count + " videos · last 24h") : "No videos in last 24h"
       if (root.busy) line = Model.stageLabel(root.stage)
-      return "YouTube Suggestor\n" + line + "\nClick to open"
+      return "YouTube Suggester\n" + line + "\nClick to open"
     }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.MiddleButton) {
@@ -272,7 +272,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: "YouTube Suggestor · last 24h"
+              text: "YouTube Suggester · last 24h"
               textFormat: Text.PlainText
               color: Color.foreground
               font.family: Style.font.family

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YouTube Suggestor engine for the Omarchy Quattro plugin.
+"""YouTube Suggester engine for the Omarchy Quattro plugin.
 
 Pipeline:
   1. Build the watched set from local browser history (Firefox/Chrome family)
@@ -1249,7 +1249,7 @@ def cmd_summarize(args):
 
     try:
         subprocess.run(
-            ["notify-send", "-a", "YouTube Suggestor", "YouTube Suggestor", note],
+            ["notify-send", "-a", "YouTube Suggester", "YouTube Suggester", note],
             timeout=10,
             check=False,
         )
@@ -1311,7 +1311,7 @@ def notify(title, message):
         subprocess.run(
             [
                 "notify-send",
-                "-a", "YouTube Suggestor",
+                "-a", "YouTube Suggester",
                 title,
                 message,
             ],

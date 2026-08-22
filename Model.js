@@ -1,4 +1,4 @@
-// Helpers for parsing and presenting YouTube Suggestor state.
+// Helpers for parsing and presenting YouTube Suggester state.
 .pragma library
 
 function stageLabel(stage) {
