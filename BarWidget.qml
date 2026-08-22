@@ -32,7 +32,7 @@ Panel {
     return popupItem
   }
 
-  readonly property string pluginId: manifest && manifest.id ? manifest.id : "io.github.kkosu.youtube-suggestor"
+  readonly property string pluginId: manifest && manifest.id ? manifest.id : "io.github.kkosu.youtube-suggester"
   readonly property var liveService: service || (bar && bar.shell ? bar.shell.serviceFor(pluginId) : null)
   readonly property var recs: liveService ? liveService.recommendations : []
   readonly property var recentItems: liveService ? (liveService.recent || []) : []
