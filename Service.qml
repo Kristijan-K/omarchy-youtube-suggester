@@ -37,20 +37,64 @@ Item {
     runProcess.running = true
   }
 
+  function refreshWithRecommended() {
+    if (runProcess.running) return
+    lastError = ""
+    runProcess.command = [engineScript, "run", "--with-recommended"]
+    runProcess.running = true
+  }
+
   function openVideo(videoId) {
     if (!videoId || openProcess.running) return
     openProcess.command = [engineScript, "open", videoId]
     openProcess.running = true
   }
 
-  function transcribe(videoId) {
-    if (!videoId || transcribeProcess.running) return
-    transcribeProcess.command = [engineScript, "transcribe", videoId]
-    transcribeProcess.running = true
+  property var summarizeQueue: []
+  property string currentSummarizeId: ""
+
+  function summarize(videoId) {
+    if (!videoId) return
+    if (videoId === currentSummarizeId) return
+    if (summarizeQueue.indexOf(videoId) !== -1) return
+    if (summarizeProcess.running) {
+      summarizeQueue.push(videoId)
+      return
+    }
+    currentSummarizeId = videoId
+    summarizeProcess.command = [engineScript, "summarize", videoId]
+    summarizeProcess.running = true
   }
 
-  readonly property bool transcribing: transcribeProcess.running
-  readonly property var transcribingItem: state.transcribing || null
+  function summarizeAll(videoIds) {
+    if (!videoIds || videoIds.length === 0) return
+    for (var i = 0; i < videoIds.length; i++) {
+      var id = videoIds[i]
+      if (id !== currentSummarizeId && summarizeQueue.indexOf(id) === -1) {
+        summarizeQueue.push(id)
+      }
+    }
+    if (!summarizeProcess.running && summarizeQueue.length > 0) {
+      var next = summarizeQueue.shift()
+      currentSummarizeId = next
+      summarizeProcess.command = [engineScript, "summarize", next]
+      summarizeProcess.running = true
+    }
+  }
+
+  function _processNextSummarize() {
+    if (summarizeQueue.length > 0 && !summarizeProcess.running) {
+      var nxt = summarizeQueue.shift()
+      currentSummarizeId = nxt
+      summarizeProcess.command = [engineScript, "summarize", nxt]
+      summarizeProcess.running = true
+    } else if (summarizeQueue.length === 0) {
+      currentSummarizeId = ""
+    }
+  }
+
+  readonly property bool summarizing: summarizeProcess.running || summarizeQueue.length > 0
+  readonly property var summarizingItem: state.transcribing || null
 
   function saveInterests(keywords) {
     if (configProcess.running) return
@@ -84,12 +128,32 @@ Item {
     }
     stderr: StdioCollector { id: runError; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode !== 0 && !root.busy) {
-        root.lastError = String(runError.text || "Pipeline failed").trim()
-        root.runFinished(false, root.lastError)
-      } else {
-        root.loadStatus() // reconcile final state from disk
+      if (exitCode !== 0) {
+        var msg = String(runError.text || "Pipeline failed (exit " + exitCode + ")").trim()
+        if (!msg) msg = "Pipeline failed"
+        root.lastError = msg
+        root.runFinished(false, msg)
+        // If we died while busy, the state file is stale (still at
+        // metadata 3/35). Don't reload it and re-enter busy — surface
+        // the error directly.
+        if (root.busy) {
+          root.state = {
+            stage: "error",
+            error: msg,
+            detail: "",
+            progress: {done: 0, total: 0},
+            interests: root.interests,
+            recommendations: root.recommendations,
+            recent: root.recent,
+            candidates_seen: root.candidatesSeen,
+            transcribed: root.transcribed,
+            watched_count: root.watchedCount,
+            updated_at: new Date().toISOString().slice(0,19)
+          }
+          return
+        }
       }
+      Qt.callLater(function() { root.loadStatus() })
     }
   }
 
@@ -106,21 +170,25 @@ Item {
   Process {
     id: openProcess
     stderr: StdioCollector { waitForEnd: true }
-  }
-
-  Process {
-    id: transcribeProcess
-    stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
-      root.loadStatus() // pick up the finished transcript summary
+      if (exitCode === 0) root.loadStatus() // refresh recent; opened videos stay visible until next R
     }
   }
 
-  // While a background transcription runs, keep the panel state fresh.
+  Process {
+    id: summarizeProcess
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.loadStatus() // pick up the finished summary
+      Qt.callLater(function() { root._processNextSummarize() })
+    }
+  }
+
+  // While a background summary runs, keep the panel state fresh.
   Timer {
     interval: 1500
     repeat: true
-    running: transcribeProcess.running
+    running: root.summarizing
     onTriggered: root.loadStatus()
   }
 
@@ -128,7 +196,13 @@ Item {
     id: configProcess
     stderr: StdioCollector { waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) root.loadStatus()
+      if (exitCode === 0) {
+        root.loadStatus()
+        // Auto-refresh so editing tags immediately shows new classification
+        Qt.callLater(function() {
+          if (!root.busy && !runProcess.running) root.refresh()
+        })
+      }
     }
   }
 

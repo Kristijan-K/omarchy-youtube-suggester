@@ -38,6 +38,7 @@ CACHE_DIR = HOME / ".cache" / "omarchy" / "youtube-suggestor"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = CACHE_DIR / "state.json"
 SEEN_FILE = CACHE_DIR / "seen.json"
+DISMISSED_FILE = CACHE_DIR / "dismissed.json"
 
 DEFAULT_CONFIG = {
     "interests": [],
@@ -45,12 +46,11 @@ DEFAULT_CONFIG = {
     "feed_limit": 120,
     "use_account_history": True,
     "account_history_limit": 200,
-    "max_candidates": 15,
+    "max_candidates": 60,
     "metadata_workers": 4,
-    "recommend_count": 3,
     "transcribe_whisper": True,
     "whisper_model": "base.en",
-    "max_whisper_minutes": 20,
+    "max_whisper_minutes": 180,
     "subs_langs": ["en", "en-US", "en-GB"],
 }
 
@@ -287,6 +287,18 @@ def save_seen(seen):
     atomic_write_json(SEEN_FILE, {"ids": sorted(seen)})
 
 
+def load_dismissed():
+    data = load_json(DISMISSED_FILE, {})
+    ids = data.get("ids", [])
+    return set(ids), ids
+
+
+def save_dismissed(dismissed_ids):
+    """Persist dismissed video ids in dismissal order (oldest trimmed first)."""
+    ensure_dirs()
+    atomic_write_json(DISMISSED_FILE, {"ids": list(dismissed_ids)[-500:]})
+
+
 RECENT_FILE = CACHE_DIR / "recent.json"
 RECENT_LIMIT = 5
 
@@ -310,6 +322,7 @@ def new_state(stage="idle", **extra):
         "progress": {"done": 0, "total": 0},
         "interests": [],
         "recommendations": [],
+        "pool": [],
         "recent": [],
         "candidates_seen": 0,
         "transcribed": 0,
@@ -495,6 +508,69 @@ def fetch_feed(cfg):
     return entries
 
 
+def fetch_recommended(cfg, limit=None):
+    """Return raw entries from YouTube's personalized Recommended feed.
+
+    Uses the same cookie handling as the subscriptions feed. Returns [] on
+    failure (e.g., not logged in or feed empty) so the caller can fall back
+    to subscriptions only.
+    """
+    feed_limit = int(limit or cfg.get("feed_limit", 120))
+    # Both URLs are tried; yt-dlp maps them to youtube:recommended extractor.
+    for url in (
+        "https://www.youtube.com/feed/recommended",
+        ":ytrec",
+    ):
+        cmd = [
+            "yt-dlp",
+            *cookie_args(cfg.get("browser")),
+            "--flat-playlist",
+            "--no-warnings",
+            "--quiet",
+            "--playlist-end",
+            str(feed_limit),
+            "--dump-json",
+            url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        entries = []
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except ValueError:
+                continue
+            vid = data.get("id") or ""
+            if not re.fullmatch(r"[\w-]{11}", vid):
+                continue
+
+            def num(value):
+                try:
+                    return int(float(value))
+                except (TypeError, ValueError):
+                    return 0
+
+            entries.append(
+                {
+                    "id": vid,
+                    "title": data.get("title") or "(untitled)",
+                    "channel": data.get("channel")
+                    or data.get("uploader")
+                    or "YouTube",
+                    "duration": num(data.get("duration")),
+                    "views": num(data.get("view_count")),
+                }
+            )
+        if entries:
+            return entries
+        # If first URL gave nothing but succeeded, try next URL
+        if proc.returncode == 0:
+            continue
+    return []
+
+
 # ---------------------------------------------------------------------------
 # metadata (tags/description) fetching + scoring
 
@@ -526,9 +602,11 @@ def score_metadata(title, tags, description, keywords):
     """Score a video's metadata against interest keywords.
 
     Tags weigh most (explicit creator intent), then title, then description.
+    Returns (total_score, matched_keywords, per_keyword_scores).
     """
     total = 0
     matched = []
+    per_keyword = {}
     title_lower = (title or "").lower()
     tags_lower = " ".join(tags or []).lower()
     desc_lower = (description or "").lower()
@@ -540,10 +618,17 @@ def score_metadata(title, tags, description, keywords):
         th = len(pat.findall(title_lower))
         gh = len(pat.findall(tags_lower))
         dh = len(pat.findall(desc_lower))
-        if th or gh or dh:
-            matched.append(kw)
-            total += 3 * th + 4 * min(gh, 10) + dh
-    return total, matched
+        # A single incidental description hit ("music by …" credits, sponsor
+        # blurbs like "ai-powered dictation") is not a real match: require a
+        # title or creator-tag hit, or several description mentions.
+        if th + gh == 0 and dh < 2:
+            per_keyword[kw] = 0
+            continue
+        score = 3 * th + 4 * min(gh, 10) + dh
+        per_keyword[kw] = score
+        matched.append(kw)
+        total += score
+    return total, matched, per_keyword
 
 
 def snippet(text, keywords, max_chars=320):
@@ -650,7 +735,7 @@ def fetch_whisper(cfg, video_id, workdir):
         str(workdir / f"{video_id}.%(ext)s"),
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    subprocess.run(audio_cmd, capture_output=True, text=True, timeout=300)
+    subprocess.run(audio_cmd, capture_output=True, text=True, timeout=600)
     audio_files = list(workdir.glob(f"{video_id}*.mp3"))
     if not audio_files:
         return None, None
@@ -666,7 +751,7 @@ def fetch_whisper(cfg, video_id, workdir):
         str(out_dir),
         str(audio_files[0]),
     ]
-    subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     txt_files = list(out_dir.glob("*.txt"))
     if not txt_files:
         return None, None
@@ -717,11 +802,162 @@ def format_duration(seconds):
 # pipeline
 
 
-def run_pipeline(limit=None):
+def _base_item(entry, meta, interests):
+    tags = (meta or {}).get("tags") or []
+    description = (meta or {}).get("description") or ""
+    score, matched, per_keyword = score_metadata(
+        entry["title"], tags, description, interests
+    )
+    item = {
+        **entry,
+        "duration_formatted": format_duration(entry.get("duration")),
+        "score": score,
+        "matched": matched,
+        "keyword_scores": per_keyword,
+        "meta_description": description,
+        "tags": tags[:12],
+        "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
+        "url": f"https://www.youtube.com/watch?v={entry['id']}",
+        "transcript_source": "none",
+        "transcript_status": "idle",
+        "description": "",
+    }
+    apply_trending(item, meta)
+    return item
+
+
+# ---------------------------------------------------------------------------
+# recency + trending
+
+
+def _upload_timestamp(meta):
+    """Best-effort upload unix time from yt-dlp metadata (0 when unknown)."""
+    ts = (meta or {}).get("timestamp")
+    if ts:
+        try:
+            return int(ts)
+        except (TypeError, ValueError):
+            pass
+    upload_date = (meta or {}).get("upload_date")
+    if upload_date:
+        try:
+            return int(time.mktime(time.strptime(upload_date, "%Y%m%d")))
+        except (OverflowError, ValueError):
+            pass
+    return 0
+
+
+def apply_trending(item, meta):
+    """Attach upload age and a trending velocity (views/hour) to an item."""
+    views = (meta or {}).get("view_count") or item.get("views") or 0
+    item["views"] = int(views or 0)
+    ts = _upload_timestamp(meta)
+    now = time.time()
+    if ts > 0:
+        age_hours = max((now - ts) / 3600.0, 0.5)
+        item["uploaded_at"] = ts
+        item["age_label"] = format_age(age_hours)
+        item["views_per_hour"] = int(views / age_hours)
+    else:
+        item["uploaded_at"] = 0
+        item["age_label"] = ""
+        item["views_per_hour"] = 0
+    return item
+
+
+def format_age(hours):
+    if hours < 1:
+        return f"{max(1, int(hours * 60))}m"
+    if hours < 48:
+        return f"{int(hours)}h"
+    if hours < 24 * 14:
+        return f"{int(hours / 24)}d"
+    return f"{int(hours / (24 * 7))}w"
+
+
+def recency_tier(item):
+    """0 = last 24h, 1 = last 3 days, 2 = last week, 3 = older/unknown."""
+    ts = item.get("uploaded_at") or 0
+    if not ts:
+        return 3
+    age_hours = (time.time() - ts) / 3600.0
+    if age_hours <= 24:
+        return 0
+    if age_hours <= 72:
+        return 1
+    if age_hours <= 24 * 7:
+        return 2
+    return 3
+
+
+def pool_sort_key(item):
+    """Latest uploads first; within the same freshness window, most
+    trending (views/hour), then most viewed overall."""
+    return (
+        recency_tier(item),
+        -item.get("views_per_hour", 0),
+        -item.get("views", 0),
+    )
+
+
+def format_views_per_hour(vph):
+    if not vph:
+        return ""
+    if vph >= 1000:
+        return f"{vph / 1000:.1f}k/hr"
+    return f"{vph}/hr"
+
+
+def _pick_all_for_tag(pool, tag):
+    """All candidates that genuinely match `tag`, sorted by popularity."""
+    def kw_score(item):
+        return (item.get("keyword_scores") or {}).get(tag, 0)
+
+    matched = [p for p in pool if kw_score(p) > 0]
+    matched = sorted(matched, key=pool_sort_key)
+    out = []
+    for item in matched:
+        entry = dict(item)
+        entry["tag"] = tag
+        # Keep snippet for list view; full description also available.
+        entry["description"] = (
+            snippet(item.get("meta_description"), [tag])
+            or item.get("meta_description", "")[:320]
+            or "No description available. Press T to summarize."
+        )
+        entry["transcript_source"] = item.get("transcript_source", "none")
+        entry["transcript_status"] = item.get("transcript_status", "idle")
+        out.append(entry)
+    return out
+
+
+def _pick_others(pool, tags):
+    """Videos matching no tag — sorted by popularity."""
+    def any_match(item):
+        ks = item.get("keyword_scores") or {}
+        return any(ks.get(t, 0) > 0 for t in tags)
+    others = [p for p in pool if not any_match(p)]
+    others = sorted(others, key=pool_sort_key)
+    out = []
+    for item in others:
+        entry = dict(item)
+        entry["tag"] = "Others"
+        entry["description"] = (
+            snippet(item.get("meta_description"), [])
+            or item.get("meta_description", "")[:320]
+            or "No description available."
+        )
+        entry["transcript_source"] = item.get("transcript_source", "none")
+        entry["transcript_status"] = item.get("transcript_status", "idle")
+        out.append(entry)
+    return out
+
+
+def run_pipeline(limit=None, include_recommended=False):
     cfg = load_config()
     interests = [k for k in cfg.get("interests", []) if k.strip()]
-    limit = limit or cfg.get("max_candidates", 15)
-    recommend_count = cfg.get("recommend_count", 3)
+    tags = interests  # no pseudo-tag; Others handles unmatched
+    limit = limit or cfg.get("max_candidates", 60)
 
     state = new_state(stage="history", interests=interests)
     publish_state(state)
@@ -737,12 +973,31 @@ def run_pipeline(limit=None):
     publish_state(state)
     try:
         entries = fetch_feed(cfg)
+        for e in entries:
+            e["source"] = "subs"
+        if include_recommended:
+            state = dict(state, detail="Fetching YouTube Recommended…")
+            publish_state(state)
+            rec_entries = fetch_recommended(cfg, limit=20)
+            for e in rec_entries:
+                e["source"] = "rec"
+            seen_ids = {e["id"] for e in entries}
+            for e in rec_entries:
+                if e["id"] not in seen_ids:
+                    entries.append(e)
+                    seen_ids.add(e["id"])
     except Exception as exc:
         publish_state(new_state(stage="error", error=str(exc), interests=interests))
         return
 
-    fresh = [e for e in entries if e["id"] not in watched]
-    candidates = fresh[:limit]
+    if include_recommended:
+        fresh_subs = [e for e in entries if e["id"] not in watched and e.get("source") == "subs"]
+        fresh_recs = [e for e in entries if e["id"] not in watched and e.get("source") == "rec"]
+        # 20 Recommended on top of subs (not interleaved within limit)
+        candidates = fresh_subs[:limit] + fresh_recs[:20]
+    else:
+        fresh = [e for e in entries if e["id"] not in watched]
+        candidates = fresh[:limit]
 
     # Phase A: score metadata (title/tags/description) concurrently —
     # no downloads, no transcription. Transcription is opt-in per video.
@@ -753,67 +1008,123 @@ def run_pipeline(limit=None):
             meta = None
         return entry, meta
 
-    scored = [None] * len(candidates)
-    completed = 0
-    workers = max(1, int(cfg.get("metadata_workers", 4)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(_meta_job, e): i for i, e in enumerate(candidates)}
-        for fut in as_completed(future_map):
-            entry, meta = fut.result()
-            tags = (meta or {}).get("tags") or []
-            description = (meta or {}).get("description") or ""
-            score, matched = score_metadata(
-                entry["title"], tags, description, interests
-            )
-            scored[future_map[fut]] = {
-                **entry,
-                "duration_formatted": format_duration(entry.get("duration")),
-                "score": score,
-                "matched": matched,
-                "meta_description": description,
-                "tags": tags[:12],
-                "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
-                "url": f"https://www.youtube.com/watch?v={entry['id']}",
-                "transcript_source": "none",
-                "transcript_status": "idle",
-                "description": "",
-            }
-            completed += 1
-            state = dict(
-                state,
-                stage="metadata",
-                detail=entry["title"],
-                progress={"done": completed, "total": len(candidates)},
-                candidates_seen=len(entries),
-            )
-            publish_state(state)
+    try:
+        pool = [None] * len(candidates)
+        completed = 0
+        workers = max(1, int(cfg.get("metadata_workers", 4)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_map = {ex.submit(_meta_job, e): i for i, e in enumerate(candidates)}
+            for fut in as_completed(future_map):
+                try:
+                    entry, meta = fut.result()
+                except Exception as exc:
+                    # One fetch failed — skip it but keep pipeline alive
+                    completed += 1
+                    state = dict(
+                        state,
+                        stage="metadata",
+                        detail=f"Skipped (fetch error: {exc})",
+                        progress={"done": completed, "total": len(candidates)},
+                        candidates_seen=len(entries),
+                    )
+                    publish_state(state)
+                    continue
+                try:
+                    pool[future_map[fut]] = _base_item(entry, meta, interests)
+                except Exception as exc:
+                    # Bad metadata should not kill the whole run
+                    pool[future_map[fut]] = {
+                        **entry,
+                        "duration_formatted": format_duration(entry.get("duration")),
+                        "score": 0,
+                        "matched": [],
+                        "keyword_scores": {},
+                        "meta_description": (meta or {}).get("description") or "",
+                        "tags": [],
+                        "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
+                        "url": f"https://www.youtube.com/watch?v={entry['id']}",
+                        "transcript_source": "none",
+                        "transcript_status": "idle",
+                        "description": "",
+                        "views": entry.get("views", 0),
+                        "uploaded_at": 0,
+                        "age_label": "",
+                        "views_per_hour": 0,
+                    }
+                completed += 1
+                state = dict(
+                    state,
+                    stage="metadata",
+                    detail=entry["title"],
+                    progress={"done": completed, "total": len(candidates)},
+                    candidates_seen=len(entries),
+                )
+                publish_state(state)
 
-    ranked = sorted(scored, key=lambda r: (-r["score"], -r.get("views", 0)))
-    top = ranked[:recommend_count]
-    if top and all(r["score"] == 0 for r in top):
-        # Nothing matched the keywords: fall back to the most-viewed recent
-        # uploads so the panel still has something useful to show.
-        top = sorted(ranked, key=lambda r: -r.get("views", 0))[:recommend_count]
-
-    # Descriptions come from the video's own metadata; transcripts are
-    # fetched lazily per video via `transcribe <id>` on user request.
-    for item in top:
-        item["description"] = (
-            snippet(item["meta_description"], interests)
-            or "No description available. Press T to transcribe."
+        pool = sorted(
+            [p for p in pool if p],
+            key=pool_sort_key,
         )
 
-    state = new_state(
-        stage="done",
-        detail=f"{len(top)} recommendations ready",
-        interests=interests,
-        recommendations=top,
-        recent=load_recent(),
-        candidates_seen=len(entries),
-        transcribed=sum(1 for r in top if r["transcript_source"] != "none"),
-        watched_count=len(watched),
-    )
-    publish_state(state)
+        # Keep only last 24h uploads for subs; keep all Recommended (limit 20) unfiltered
+        now = time.time()
+        if include_recommended:
+            pool = [
+                p for p in pool
+                if p.get("source") == "rec"
+                or (p.get("uploaded_at") and (now - p["uploaded_at"]) < 24 * 3600)
+            ]
+        else:
+            pool = [p for p in pool if p.get("uploaded_at") and (now - p["uploaded_at"]) < 24 * 3600]
+
+        # Classify fast using metadata scoring; every tag gets all its matches,
+        # Others collects everything unmatched — all sorted by popularity.
+        recommendations = []
+        if tags:
+            for tag in tags:
+                recommendations.extend(_pick_all_for_tag(pool, tag))
+            recommendations.extend(_pick_others(pool, tags))
+        else:
+            # No tags yet — everything goes to Others so the panel is not empty.
+            for item in sorted(pool, key=pool_sort_key):
+                entry = dict(item)
+                entry["tag"] = "Others"
+                entry["description"] = (
+                    snippet(item.get("meta_description"), [])
+                    or item.get("meta_description", "")[:320]
+                    or "No description available."
+                )
+                recommendations.append(entry)
+
+        # Detail is honest when pool was empty due to 24h filter.
+        if not pool:
+            detail = "No uploads from subscriptions in last 24h" + (" + 0 recommended" if include_recommended else "")
+        elif not recommendations and tags:
+            detail = "No tag matches in last 24h — showing Others"
+            recommendations = _pick_others(pool, tags)
+        else:
+            if include_recommended:
+                rec_n = sum(1 for p in pool if p.get("source") == "rec")
+                detail = f"{len(recommendations)} videos (subs 24h + {rec_n} recommended)"
+            else:
+                detail = f"{len(recommendations)} videos from last 24h"
+
+        state = new_state(
+            stage="done",
+            detail=detail,
+            interests=interests,
+            recommendations=recommendations,
+            pool=pool,
+            recent=load_recent(),
+            candidates_seen=len(entries),
+            transcribed=sum(1 for r in recommendations if r["transcript_source"] != "none"),
+            watched_count=len(watched),
+        )
+        publish_state(state)
+    except Exception as exc:
+        import traceback
+        err = f"{exc}\n{traceback.format_exc()[-600:]}"
+        publish_state(new_state(stage="error", error=err[:800], interests=interests))
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +1132,19 @@ def run_pipeline(limit=None):
 
 
 def cmd_status(_args):
+    cfg = load_config()
     state = load_json(STATE_FILE, new_state())
+    # Stale AI runs (killed / timed-out without writing) would leave the
+    # panel stuck on "AI recommendations…" forever — surface them as error.
+    if state.get("stage") == "ai":
+        try:
+            mtime = STATE_FILE.stat().st_mtime
+            if time.time() - mtime > 600:
+                state = dict(state, stage="error", error="AI run timed out — try again", detail="")
+        except OSError:
+            pass
+    # Always surface the currently configured tags, even before a run.
+    state["interests"] = [k for k in cfg.get("interests", []) if k.strip()]
     state.setdefault("recent", load_recent())
     print(json.dumps(state), flush=True)
 
@@ -842,11 +1165,13 @@ def cmd_watch(_args):
         time.sleep(1.5)
 
 
-def cmd_transcribe(args):
-    """Transcribe one recommended video on user request (background job).
+def cmd_summarize(args):
+    """Summarize one recommended video on user request (background job).
 
-    Updates the state file when finished and fires a desktop notification so
-    the user knows the summary is ready without keeping the panel open.
+    Fetches the transcript (captions first, whisper fallback) and extracts a
+    keyword-relevant summary. Updates the state file when finished and fires
+    a desktop notification so the user knows the summary is ready without
+    keeping the panel open.
     """
     vid = args.video_id
     cfg = load_config()
@@ -876,7 +1201,7 @@ def cmd_transcribe(args):
         if (
             not transcript
             and cfg.get("transcribe_whisper", True)
-            and (target.get("duration") or 0) <= cfg.get("max_whisper_minutes", 20) * 60
+            and (target.get("duration") or 0) <= cfg.get("max_whisper_minutes", 180) * 60
         ):
             try:
                 transcript, source = fetch_whisper(cfg, vid, workdir)
@@ -885,10 +1210,36 @@ def cmd_transcribe(args):
 
     title = (target.get("title") or vid)[:60]
     if transcript:
-        target["description"] = describe(transcript, interests)
-        target["transcript_source"] = source
-        target["transcript_status"] = "ready"
-        note = f"Summary ready: {title}"
+        # Try opencode AI summary first, fall back to extractive snippet.
+        ai_summary = None
+        try:
+            prompt = (
+                f"Summarize this YouTube video transcript concisely in 4-6 bullet points. "
+                f"Keep technical details, no preamble.\n\n"
+                f"Title: {target.get('title') or vid}\n"
+                f"Transcript:\n{transcript[:12000]}"
+            )
+            ai_summary = _agent_reply(prompt, timeout=180).strip()
+            # Guard: opencode sometimes wraps in markdown — keep as is but truncate.
+            if len(ai_summary) < 20:
+                ai_summary = None
+        except Exception:
+            ai_summary = None
+
+        if ai_summary:
+            target["summary"] = ai_summary[:2000]
+            target["transcript_source"] = source
+            target["transcript_status"] = "ready"
+            note = f"Summary ready: {title}"
+        else:
+            # Fallback extractive summary
+            target["summary"] = describe(transcript, interests)
+            target["transcript_source"] = source
+            target["transcript_status"] = "ready"
+            note = f"Summary ready: {title}"
+        # Also keep description for list view if not already set
+        if not target.get("description"):
+            target["description"] = snippet(target.get("meta_description"), interests) or target["summary"][:320]
     else:
         target["transcript_status"] = "unavailable"
         note = f"No usable transcript: {title}"
@@ -907,6 +1258,70 @@ def cmd_transcribe(args):
     print(json.dumps({"id": vid, "status": target["transcript_status"]}), flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Summarize helper — uses the default Omarchy coding agent (opencode etc.)
+
+
+AI_AGENT_COMMANDS = {
+    "opencode": ["opencode", "run"],
+    "claude": ["claude", "-p"],
+    "grok": ["grok", "-p"],
+    "codex": ["codex", "exec"],
+    "gemini": ["gemini"],
+    "copilot": ["copilot", "-p"],
+    "crush": ["crush", "run"],
+}
+
+
+def _default_agent():
+    """Resolve this machine's default Omarchy coding agent name."""
+    try:
+        out = subprocess.run(
+            ["omarchy-default-agent"], capture_output=True, text=True, timeout=15
+        )
+        return out.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
+def _agent_reply(prompt, timeout=120):
+    """Run the default coding agent non-interactively; return its stdout."""
+    agent = _default_agent()
+    if agent not in AI_AGENT_COMMANDS or not shutil.which(AI_AGENT_COMMANDS[agent][0]):
+        if shutil.which("opencode"):
+            agent = "opencode"
+        else:
+            raise RuntimeError(
+                "No usable coding agent found — set one with: omarchy default agent <name>"
+            )
+    cmd = AI_AGENT_COMMANDS[agent] + [prompt]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{agent} timed out after {timeout}s")
+    reply = (proc.stdout or "").strip()
+    if not reply:
+        err = (proc.stderr or "").strip().splitlines() or ["no output"]
+        raise RuntimeError(f"{agent} returned nothing: {err[-1][:200]}")
+    return reply
+
+
+def notify(title, message):
+    try:
+        subprocess.run(
+            [
+                "notify-send",
+                "-a", "YouTube Suggestor",
+                title,
+                message,
+            ],
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def cmd_open(args):
     vid = args.video_id
     seen = load_seen()
@@ -921,6 +1336,7 @@ def cmd_open(args):
             if isinstance(item, dict) and item.get("id") == vid:
                 info = item
                 break
+
     entry = {
         "id": vid,
         "title": info.get("title") or "(untitled)",
@@ -937,7 +1353,20 @@ def cmd_open(args):
         state["recent"] = load_recent()
         atomic_write_json(STATE_FILE, state)
 
-    webbrowser.open(url)
+    # Same as Super+Shift+Y: omarchy-launch-webapp does `uwsm-app -- <browser> --app=URL`
+    try:
+        subprocess.Popen(
+            ["omarchy-launch-webapp", url],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        # Fallback for headless / testing
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     print(json.dumps({"opened": vid, "url": url}), flush=True)
 
 
@@ -950,6 +1379,12 @@ def cmd_config(args):
         cfg["interests"] = [
             k.strip() for k in args.interests.split(",") if k.strip()
         ][:5]
+        # Sync the saved tags into the published state so the UI reflects
+        # the change immediately (the old state file kept stale tags).
+        state = load_json(STATE_FILE, {})
+        if state:
+            state["interests"] = cfg["interests"]
+            atomic_write_json(STATE_FILE, state)
     if args.browser:
         cfg["browser"] = args.browser
     if args.max_candidates:
@@ -988,7 +1423,8 @@ def main():
 
     p_run = sub.add_parser("run", help="Run the full suggestor pipeline")
     p_run.add_argument("--limit", type=int, default=None)
-    p_run.set_defaults(func=lambda a: run_pipeline(a.limit))
+    p_run.add_argument("--with-recommended", action="store_true", dest="with_recommended", help="Also include YouTube's personalized Recommended feed (needs same cookies)")
+    p_run.set_defaults(func=lambda a: run_pipeline(a.limit, a.with_recommended))
 
     p_status = sub.add_parser("status", help="Print current state JSON")
     p_status.set_defaults(func=cmd_status)
@@ -1000,11 +1436,16 @@ def main():
     p_open.add_argument("video_id")
     p_open.set_defaults(func=cmd_open)
 
-    p_tr = sub.add_parser(
-        "transcribe", help="Transcribe one recommended video (background job)"
+    p_sum = sub.add_parser(
+        "summarize", help="Summarize one recommended video (background job)"
     )
+    p_sum.add_argument("video_id")
+    p_sum.set_defaults(func=cmd_summarize)
+
+    # Backwards-compatible alias for the old command name.
+    p_tr = sub.add_parser("transcribe", help="Alias for 'summarize'")
     p_tr.add_argument("video_id")
-    p_tr.set_defaults(func=cmd_transcribe)
+    p_tr.set_defaults(func=cmd_summarize)
 
     p_cfg = sub.add_parser("config", help="Get or set configuration")
     p_cfg.add_argument("action", choices=["get", "set"])

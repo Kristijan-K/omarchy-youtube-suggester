@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.kkosu.youtube-suggestor",
-  "name": "YouTube Suggestor",
+  "id": "io.github.kkosu.youtube-suggester",
+  "name": "YouTube Suggester",
   "version": "1.0.0",
   "author": "Kristijan K",
   "license": "MIT",
-  "description": "Scans your YouTube subscriptions feed, scores unwatched videos against your interest keywords using video metadata, and recommends the top 3 with on-demand transcript summaries.",
+  "description": "Scans your YouTube subscriptions (last 24h) + optional Recommended, classifies by your tags, shows all per-tag + Others sorted by popularity, with transcript summarization via your default coding agent.",
   "kinds": ["service", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {
@@ -13,8 +13,8 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "YouTube Suggestor",
-    "description": "Top 5 videos from your subscriptions, picked by AI transcription and your interests.",
+    "displayName": "YouTube Suggester",
+    "description": "Last 24h subs filtered by tags + Others, with on-demand AI summaries. Shift+R adds 20 Recommended.",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",

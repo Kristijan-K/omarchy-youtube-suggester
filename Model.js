@@ -16,7 +16,10 @@ function stageLabel(stage) {
 }
 
 function isBusy(stage) {
-  return stage === "history" || stage === "feed" || stage === "metadata" || stage === "enriching" || stage === "ranking"
+  return (
+    stage === "history" || stage === "feed" || stage === "metadata"
+    || stage === "enriching" || stage === "ranking"
+  )
 }
 
 function parseState(text) {
@@ -73,11 +76,35 @@ function sourceLabel(item) {
   }
 }
 
+function formatViewsPerHour(vph) {
+  if (!vph) return ""
+  if (vph >= 1000) return (vph / 1000).toFixed(1) + "k/hr"
+  return vph + "/hr"
+}
+
+// "5h old · 18.0k/hr views" — freshness plus trending velocity.
+function trendingBadge(item) {
+  if (!item) return ""
+  var parts = []
+  if (item.age_label) parts.push(item.age_label + " old")
+  var vph = item.views_per_hour || 0
+  if (vph >= 100) parts.push(formatViewsPerHour(vph) + " views")
+  return parts.join(" · ")
+}
+
 function transcriptBadge(item) {
   switch (item ? item.transcript_status : "") {
-    case "working": return "◌ transcribing…"
+    case "working": return "◌ summarizing…"
     case "ready": return "✓ summary ready"
     case "unavailable": return "no usable transcript"
     default: return ""
   }
+}
+
+// Badge for a tab slot — empty when there is no real keyword match
+// (fallback is now disabled, so mismatches simply don't appear).
+function matchBadge(item) {
+  if (!item) return ""
+  var sb = scoreBadge(item)
+  return sb === "no keyword match" ? "" : sb
 }
