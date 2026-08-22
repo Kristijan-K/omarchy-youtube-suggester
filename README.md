@@ -41,6 +41,20 @@ On first install `AI` and `Software` are pre-configured as tags — change them 
 
 ## Manual installation
 
+> **Manual install is required** — `omarchy plugin add` only clones the repo and does **not** install system dependencies. Install them first:
+
+**Required:**
+- `yt-dlp` — `pacman -S yt-dlp` (or `pipx install yt-dlp`)
+- Chromium cookie decrypt (for `browser: chromium`): `pacman -S python-secretstorage python-pycryptodomex` or `pip install --user secretstorage pycryptodomex` (`--break-system-packages` on Arch if needed)
+
+**Optional (for long podcasts without captions):**
+- `whisper` — `pipx install openai-whisper` (uses `whisper --model base.en`, `max_whisper_minutes: 180`, `timeout 600/1800`)
+
+**For `T` AI summaries:**
+- Default Omarchy agent — `omarchy default agent opencode` (or `claude`/`codex`/`grok`/`gemini`/`copilot`/`crush` via `mise`). Without it `T` falls back to extractive summary.
+
+Browser must be logged into YouTube matching `browser` setting (`chromium` default).
+
 ```bash
 PLUGIN_ID="io.github.kkosu.youtube-suggester"
 mkdir -p "$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin"
