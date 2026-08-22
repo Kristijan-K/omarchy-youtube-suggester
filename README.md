@@ -95,7 +95,7 @@ CLI="$HOME/.config/omarchy/plugins/io.github.kkosu.youtube-suggester/bin/omarchy
 "$CLI" open <video_id>
 ```
 
-State in `~/.cache/omarchy/youtube-suggestor/state.json` (`interests`, `recommendations[]` with `tag/source/summary`, `pool`, `recent`), `seen.json`, `recent.json`.
+State in `~/.cache/omarchy/youtube-suggester/state.json` (`interests`, `recommendations[]` with `tag/source/summary`, `pool`, `recent`), `seen.json`, `recent.json`.
 
 ## Troubleshooting
 
@@ -106,7 +106,7 @@ qs log -p "$OMARCHY_PATH/shell" --tail 100
 ```
 
 - **Feed empty / `cookies no longer valid`** — re-open YouTube in the configured browser, then `omarchy plugin validate` and `R` again; test `$CLI feed --limit 2`.
-- **Scoring stuck `metadata 3/…`** — fixed in `Service.qml:122` + `bin/omarchy-youtube-suggestor:1011` per-item `try`; if it still happens `cat state.json | jq .stage` should now be `error` not `metadata`.
+- **Scoring stuck `metadata 3/…`** — fixed in `Service.qml:122` + `bin/omarchy-youtube-suggester:1011` per-item `try`; if it still happens `cat state.json | jq .stage` should now be `error` not `metadata`.
 - **`S` shows no summary** — press `T` first; fallback is description if agent missing.
 
 ## License
@@ -115,4 +115,4 @@ qs log -p "$OMARCHY_PATH/shell" --tail 100
 
 ## Publishing
 
-Public repo + `manifest.json` at root, `README`/`LICENSE`, no `omarchy.*` id, no symlinks, `bin/omarchy-youtube-suggestor` executable, `omarchy plugin validate` and `qmllint -I $OMARCHY_PATH/shell BarWidget.qml Service.qml` must pass. Then submit at https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/new?template=submit-plugin.yml .
+Public repo + `manifest.json` at root, `README`/`LICENSE`, no `omarchy.*` id, no symlinks, `bin/omarchy-youtube-suggester` executable, `omarchy plugin validate` and `qmllint -I $OMARCHY_PATH/shell BarWidget.qml Service.qml` must pass. Then submit at https://github.com/HANCORE-linux/omarchy-plugin-marketplace/issues/new?template=submit-plugin.yml .

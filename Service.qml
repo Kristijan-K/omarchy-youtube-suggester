@@ -24,7 +24,7 @@ Item {
   property bool busy: Model.isBusy(stage)
 
   readonly property string engineScript: {
-    var raw = Qt.resolvedUrl("bin/omarchy-youtube-suggestor").toString()
+    var raw = Qt.resolvedUrl("bin/omarchy-youtube-suggester").toString()
     return raw.indexOf("file://") === 0 ? raw.substring(7) : raw
   }
 
