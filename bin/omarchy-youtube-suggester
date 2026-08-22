@@ -41,7 +41,7 @@ SEEN_FILE = CACHE_DIR / "seen.json"
 DISMISSED_FILE = CACHE_DIR / "dismissed.json"
 
 DEFAULT_CONFIG = {
-    "interests": [],
+    "interests": ["AI", "Software"],
     "browser": "chromium",
     "feed_limit": 120,
     "use_account_history": True,
