@@ -51,9 +51,34 @@ On first install `AI` and `Software` are pre-configured as tags — change them 
 - `whisper` — `pipx install openai-whisper` (uses `whisper --model base.en`, `max_whisper_minutes: 180`, `timeout 600/1800`)
 
 **For `T` AI summaries:**
-- Default Omarchy agent — `omarchy default agent opencode` (or `claude`/`codex`/`grok`/`gemini`/`copilot`/`crush` via `mise`). Without it `T` falls back to extractive summary.
+- Default Omarchy agent — `omarchy default agent opencode` (or `claude`/`codex`/`grok`/`gemini`/`copilot`/`crush` via `mise`). Without it `T` falls back to extractive summary. To disable AI summaries entirely: `omarchy-youtube-suggester config set --enable-ai-summary false` (uses local extractive summary only).
 
 Browser must be logged into YouTube matching `browser` setting (`chromium` default).
+
+## Security
+
+**Plugin privilege:** This plugin runs unsandboxed with your user privileges (same as the Omarchy shell process). Review [`bin/omarchy-youtube-suggester`](bin/omarchy-youtube-suggester) before enabling.
+
+**YouTube content is untrusted:** Video titles and captions may contain prompt-injection payloads (e.g. `Ignore previous instructions…`). This plugin hardens the summarizer path:
+- `bin/omarchy-youtube-suggester:1260+` wraps every title/transcript in explicit `BEGIN/END UNTRUSTED …` markers and prepends highest-priority `SECURITY RULES` that force the model to treat everything inside as **data only**, to ignore embedded instructions, and to never invoke tools or browse. Delimiter strings inside the content are filtered to prevent breakout.
+- Agent invocations use least-privilege flags where supported: `codex --sandbox read-only`, `claude --tools "" --permission-mode dontAsk`, `gemini --approval-mode plan`, `copilot --available-tools ""`. Even a successful injection cannot escalate to local tool execution.
+- Disable AI summaries if you prefer zero LLM exposure: `enable_ai_summary: false` (pure extractive summarization via `describe()`).
+- QML rendering: `BarWidget.qml` sets `textFormat: Text.PlainText` (and `TextEdit.PlainText` for the summary popup) on **every** `Text`/`TextEdit` element, including the flagged `775-785` popup title, so remote HTML like `<img src=…>` is never interpreted and no remote resources are fetched via `AutoText`.
+
+See `tests/test_prompt_isolation.py` and `tests/test_qml_safety.py` for regression coverage of both fixes.
+
+## Development & Tests
+
+```bash
+# Validate manifest + QML (same checks as the marketplace)
+omarchy plugin validate .
+qmllint -I /usr/share/omarchy/shell BarWidget.qml Service.qml
+
+# Python tests (prompt isolation, QML safety, config flag)
+pytest -v
+# or
+python -m pytest tests -v
+```
 
 ```bash
 PLUGIN_ID="io.github.kkosu.youtube-suggester"

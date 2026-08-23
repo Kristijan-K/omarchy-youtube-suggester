@@ -758,6 +758,7 @@ Panel {
             Layout.fillWidth: true
             Text {
               text: "Summary"
+              textFormat: Text.PlainText
               color: Color.accent
               font.family: Style.font.family
               font.bold: true
@@ -766,6 +767,7 @@ Panel {
             }
             Text {
               text: "[j/k] scroll  ·  [S] close  ·  [Esc] close"
+              textFormat: Text.PlainText
               color: Qt.darker(Color.foreground, 1.8)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -774,6 +776,7 @@ Panel {
 
           Text {
             text: root.popupTitle
+            textFormat: Text.PlainText
             color: Color.foreground
             font.family: Style.font.family
             font.bold: true
@@ -797,6 +800,7 @@ Panel {
             TextEdit {
               id: summaryText
               width: parent.width
+              textFormat: TextEdit.PlainText
               // Live binding so summary appears automatically when ready
               text: {
                 var it = root.popupLiveItem
@@ -832,6 +836,7 @@ Panel {
                 id: okLabel
                 anchors.centerIn: parent
                 text: "Close [S / Esc]"
+                textFormat: Text.PlainText
                 color: "white"
                 font.family: Style.font.family
                 font.bold: true

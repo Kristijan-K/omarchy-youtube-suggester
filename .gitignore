@@ -1,3 +1,4 @@
 *.tmp
 preview.png.bak
 __pycache__/
+.pytest_cache/
