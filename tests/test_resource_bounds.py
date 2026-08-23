@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 
@@ -104,3 +105,42 @@ def test_qml_process_output_is_not_collected_without_a_bound():
     assert "appendBoundedOutput" in source
     assert "maxStatusOutputChars" in source
     assert "maxErrorOutputChars" in source
+
+
+def test_cookie_export_is_private_and_scoped(tmp_path, monkeypatch):
+    engine = load_engine()
+    monkeypatch.setattr(engine, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(
+        engine, "LEGACY_COOKIES_FILE", tmp_path / "cache" / "cookies.txt"
+    )
+
+    exported = engine._write_secure_cookie_file(["secret-cookie"])
+    assert stat_mode(exported) == 0o600
+    assert exported.read_text(encoding="utf-8") == "secret-cookie\n"
+
+    monkeypatch.setattr(engine, "_AES", object())
+    monkeypatch.setattr(engine, "export_browser_cookies", lambda _browser: exported)
+    with engine.cookie_args("chromium") as args:
+        assert args == ["--cookies", str(exported)]
+        assert exported.exists()
+    assert not exported.exists()
+
+
+def test_legacy_cookie_file_is_removed_on_startup(tmp_path, monkeypatch):
+    engine = load_engine()
+    cache_dir = tmp_path / "cache"
+    legacy = cache_dir / "cookies.txt"
+    monkeypatch.setattr(engine, "CONFIG_DIR", tmp_path / "config")
+    monkeypatch.setattr(engine, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(engine, "LEGACY_COOKIES_FILE", legacy)
+    cache_dir.mkdir()
+    legacy.write_text("old-secret", encoding="utf-8")
+
+    engine.ensure_dirs()
+
+    assert not legacy.exists()
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777

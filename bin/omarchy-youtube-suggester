@@ -15,6 +15,7 @@ single JSON line, so the QML service can stream live progress.
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -89,7 +90,7 @@ CHROMIUM_BROWSERS = {
     },
 }
 
-COOKIES_FILE = CACHE_DIR / "cookies.txt"
+LEGACY_COOKIES_FILE = CACHE_DIR / "cookies.txt"
 
 MAX_PERSISTED_JSON_BYTES = 1024 * 1024
 MAX_STATE_BYTES = 1024 * 1024
@@ -354,11 +355,37 @@ def _webkit_to_unix(microseconds):
     return int(microseconds / 1_000_000 - 11644473600)
 
 
+def _write_secure_cookie_file(lines):
+    """Create a mode-0600 cookie file that the caller must remove."""
+    ensure_dirs()
+    fd, name = tempfile.mkstemp(prefix=".cookies-", suffix=".txt", dir=CACHE_DIR)
+    open_fd = fd
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            open_fd = None
+            fh.write("\n".join(lines) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        return Path(name)
+    except Exception:
+        if open_fd is not None:
+            try:
+                os.close(open_fd)
+            except OSError:
+                pass
+        try:
+            Path(name).unlink()
+        except OSError:
+            pass
+        raise
+
+
 def export_browser_cookies(browser):
     """Decrypt the browser cookie DB into a Netscape cookies.txt file.
 
     Returns the path on success, None when unsupported or nothing usable
-    was decrypted.
+    was decrypted. The caller owns and must remove the temporary file.
     """
     if _AES is None or browser not in CHROMIUM_BROWSERS:
         return None
@@ -410,10 +437,7 @@ def export_browser_cookies(browser):
         count += 1
     if count < 5:  # a logged-in session always carries many google/youtube cookies
         return None
-    ensure_dirs()
-    COOKIES_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(COOKIES_FILE, 0o600)
-    return COOKIES_FILE
+    return _write_secure_cookie_file(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +447,17 @@ def export_browser_cookies(browser):
 def ensure_dirs():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for directory in (CONFIG_DIR, CACHE_DIR):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
+    try:
+        LEGACY_COOKIES_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def load_json(path, default, max_bytes=MAX_PERSISTED_JSON_BYTES):
@@ -722,28 +757,33 @@ def collect_browser_history_ids():
     return ids
 
 
-def fetch_account_history_ids(cfg):
+def fetch_account_history_ids(cfg, auth_args=None):
     """Best-effort: recent watch-history entries from the YouTube account.
 
     Catches videos watched on other devices; requires working cookies and
     history being enabled on the account.
     """
+    if auth_args is None:
+        with cookie_args(cfg.get("browser")) as scoped_args:
+            return fetch_account_history_ids(cfg, scoped_args)
     limit = _bounded_int(cfg.get("account_history_limit"), 200, 1, 1000)
-    cmd = [
-        "yt-dlp",
-        *cookie_args(cfg.get("browser")),
-        "--flat-playlist",
-        "--no-warnings",
-        "--quiet",
-        "--playlist-end",
-        str(limit),
-        "--print",
-        "%(id)s",
-        ":ythistory",
-    ]
     ids = set()
     try:
-        proc, _limited = run_bounded(cmd, timeout=120)
+        cmd = [
+            "yt-dlp",
+            *auth_args,
+            "--flat-playlist",
+            "--no-warnings",
+            "--quiet",
+            "--playlist-end",
+            str(limit),
+            "--print",
+            "%(id)s",
+            ":ythistory",
+        ]
+        proc, limited = run_bounded(cmd, timeout=120)
+        if limited:
+            return ids
         for line in proc.stdout.splitlines():
             vid = line.strip()
             if re.fullmatch(r"[\w-]{11}", vid):
@@ -759,35 +799,43 @@ def fetch_account_history_ids(cfg):
 # feed fetching (yt-dlp + browser cookies)
 
 
-_COOKIE_ARGS_CACHE = {}
-
-
+@contextmanager
 def cookie_args(browser):
-    """yt-dlp auth args: our decrypted cookies.txt when possible."""
+    """Yield yt-dlp auth args and remove any exported cookie file afterward."""
     if not browser or browser == "none":
-        return []
-    if browser in _COOKIE_ARGS_CACHE:
-        return _COOKIE_ARGS_CACHE[browser]
-    args = []
+        yield []
+        return
+
+    exported = None
     if _AES is not None:
         try:
             exported = export_browser_cookies(browser)
         except Exception:
             exported = None
-        if exported:
-            args = ["--cookies", str(exported)]
-    if not args:
-        args = ["--cookies-from-browser", browser]
-    _COOKIE_ARGS_CACHE[browser] = args
-    return args
+    if not exported:
+        yield ["--cookies-from-browser", browser]
+        return
+
+    try:
+        yield ["--cookies", str(exported)]
+    finally:
+        try:
+            Path(exported).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
-def fetch_feed(cfg):
+def fetch_feed(cfg, auth_args=None):
     """Return raw entries from the logged-in subscriptions feed."""
+    if auth_args is None:
+        with cookie_args(cfg.get("browser")) as scoped_args:
+            return fetch_feed(cfg, scoped_args)
     feed_limit = _bounded_int(cfg.get("feed_limit"), 120, 1, 500)
     cmd = [
         "yt-dlp",
-        *cookie_args(cfg.get("browser")),
+        *auth_args,
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
@@ -797,6 +845,8 @@ def fetch_feed(cfg):
         "https://www.youtube.com/feed/subscriptions",
     ]
     proc, limited = run_bounded(cmd, timeout=240)
+    if limited:
+        raise RuntimeError("yt-dlp feed output or timeout limit reached")
     entries = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -842,13 +892,16 @@ def fetch_feed(cfg):
     return entries
 
 
-def fetch_recommended(cfg, limit=None):
+def fetch_recommended(cfg, limit=None, auth_args=None):
     """Return raw entries from YouTube's personalized Recommended feed.
 
     Uses the same cookie handling as the subscriptions feed. Returns [] on
     failure (e.g., not logged in or feed empty) so the caller can fall back
     to subscriptions only.
     """
+    if auth_args is None:
+        with cookie_args(cfg.get("browser")) as scoped_args:
+            return fetch_recommended(cfg, limit, scoped_args)
     feed_limit = _bounded_int(limit or cfg.get("feed_limit"), 120, 1, 500)
     # Both URLs are tried; yt-dlp maps them to youtube:recommended extractor.
     for url in (
@@ -857,7 +910,7 @@ def fetch_recommended(cfg, limit=None):
     ):
         cmd = [
             "yt-dlp",
-            *cookie_args(cfg.get("browser")),
+            *auth_args,
             "--flat-playlist",
             "--no-warnings",
             "--quiet",
@@ -866,7 +919,9 @@ def fetch_recommended(cfg, limit=None):
             "--dump-json",
             url,
         ]
-        proc, _limited = run_bounded(cmd, timeout=240)
+        proc, limited = run_bounded(cmd, timeout=240)
+        if limited:
+            continue
         entries = []
         for line in proc.stdout.splitlines():
             line = line.strip()
@@ -914,18 +969,23 @@ def fetch_recommended(cfg, limit=None):
 # metadata (tags/description) fetching + scoring
 
 
-def fetch_metadata(cfg, video_id):
+def fetch_metadata(cfg, video_id, auth_args=None):
     """Fetch one video's metadata JSON (tags, description, …) — no download."""
+    if auth_args is None:
+        with cookie_args(cfg.get("browser")) as scoped_args:
+            return fetch_metadata(cfg, video_id, scoped_args)
     cmd = [
         "yt-dlp",
-        *cookie_args(cfg.get("browser")),
+        *auth_args,
         "--skip-download",
         "--no-warnings",
         "--quiet",
         "--dump-json",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    proc, _limited = run_bounded(cmd, timeout=60)
+    proc, limited = run_bounded(cmd, timeout=60)
+    if limited:
+        return None
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
