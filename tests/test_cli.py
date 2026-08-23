@@ -1,10 +1,10 @@
-"""CLI/config tests for enable_ai_summary toggle and basic pipeline safety."""
-import importlib.util
+"""CLI/config tests for the metadata-only pipeline."""
 import json
 import pathlib
 import subprocess
 import sys
-import tempfile
+
+import pytest
 
 BIN_PATH = pathlib.Path(__file__).resolve().parents[1] / "bin" / "omarchy-youtube-suggester"
 
@@ -20,33 +20,37 @@ def run_bin(*args, env=None):
     return proc
 
 
-def test_config_enable_ai_summary_roundtrip(tmp_path, monkeypatch):
+def test_config_has_no_ai_summary_setting(tmp_path):
     # Redirect HOME so config/state go to tmp
     import os
 
-    monkeypatch.setenv("HOME", str(tmp_path))
-    # Need XDG config/cache dirs inside tmp HOMEDIR - bin uses Path.home()
-    # Reload module after HOME change: just exercise CLI via subprocess with HOME override
+    config_path = tmp_path / ".config" / "youtube-suggester" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "enable_ai_summary": True,
+                "transcribe_whisper": True,
+                "whisper_model": "base.en",
+            }
+        ),
+        encoding="utf-8",
+    )
     env = {**os.environ, "HOME": str(tmp_path)}
     proc = run_bin("config", "get", env=env)
     assert proc.returncode == 0, proc.stderr
     cfg = json.loads(proc.stdout)
-    assert "enable_ai_summary" in cfg
+    assert "enable_ai_summary" not in cfg
 
-    proc = run_bin("config", "set", "--enable-ai-summary", "false", env=env)
-    assert proc.returncode == 0, proc.stderr
-    cfg = json.loads(proc.stdout)
-    assert cfg["enable_ai_summary"] is False
 
-    proc = run_bin("config", "get", env=env)
-    assert proc.returncode == 0
-    cfg = json.loads(proc.stdout)
-    assert cfg["enable_ai_summary"] is False
+@pytest.mark.parametrize("command", ["summarize", "transcribe"])
+def test_transcription_commands_removed(tmp_path, command):
+    import os
 
-    proc = run_bin("config", "set", "--enable-ai-summary", "true", env=env)
-    assert proc.returncode == 0
-    cfg = json.loads(proc.stdout)
-    assert cfg["enable_ai_summary"] is True
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = run_bin(command, "video-id", env=env)
+    assert proc.returncode != 0
+    assert "invalid choice" in proc.stderr
 
 
 def test_config_default_interests_preserved(tmp_path, monkeypatch):

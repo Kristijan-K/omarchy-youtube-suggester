@@ -68,14 +68,6 @@ function matchedItem(item) {
   return item && item.score > 0
 }
 
-function sourceLabel(item) {
-  switch (item ? item.transcript_source : "") {
-    case "captions": return "captions"
-    case "whisper": return "whisper"
-    default: return "no transcript"
-  }
-}
-
 function formatViewsPerHour(vph) {
   if (!vph) return ""
   if (vph >= 1000) return (vph / 1000).toFixed(1) + "k/hr"
@@ -90,15 +82,6 @@ function trendingBadge(item) {
   var vph = item.views_per_hour || 0
   if (vph >= 100) parts.push(formatViewsPerHour(vph) + " views")
   return parts.join(" · ")
-}
-
-function transcriptBadge(item) {
-  switch (item ? item.transcript_status : "") {
-    case "working": return "◌ summarizing…"
-    case "ready": return "✓ summary ready"
-    case "unavailable": return "no usable transcript"
-    default: return ""
-  }
 }
 
 // Badge for a tab slot — empty when there is no real keyword match

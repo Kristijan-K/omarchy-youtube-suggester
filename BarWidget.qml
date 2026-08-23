@@ -18,9 +18,9 @@ Panel {
   property bool editingInterests: false
   property string interestsDraft: ""
   property string activeTag: ""
-  property bool showSummaryPopup: false
+  property bool showDescriptionPopup: false
   property string popupTitle: ""
-  property string popupSummary: ""
+  property string popupDescription: ""
   property var popupItem: null
   readonly property var popupLiveItem: {
     if (!popupItem) return null
@@ -90,7 +90,7 @@ Panel {
   onOpenedChanged: if (opened) {
     selectedIndex = 0
     editingInterests = false
-    showSummaryPopup = false
+    showDescriptionPopup = false
     activeTag = root.tabNames.length > 0 ? root.tabNames[0] : ""
     if (liveService) liveService.loadStatus()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -117,82 +117,29 @@ Panel {
     }
   }
 
-  function summarizeSelected() {
-    if (!root.liveService || root.visibleRecs.length === 0) return
-    if (selectedIndex < root.visibleRecs.length) {
-      var sel = root.visibleRecs[selectedIndex]
-      if (sel.transcript_status === "working") return
-      if (sel.transcript_status === "ready" && sel.summary) {
-        // Already summarized — just show popup
-        openSummaryPopup()
-        return
-      }
-      root.liveService.summarize(sel.id)
-    }
-  }
-
-  function summarizeAllInTag() {
-    if (!root.liveService || root.visibleRecs.length === 0) return
-    if (!root.activeTag || root.activeTag === "Others") return
-    var ids = []
-    for (var i = 0; i < root.visibleRecs.length; i++) {
-      var it = root.visibleRecs[i]
-      if (!it || it.transcript_status === "working") continue
-      if (it.summary && it.summary.length > 0) continue
-      if (it.transcript_status === "ready") continue
-      ids.push(it.id)
-    }
-    if (ids.length === 0) return
-    if (root.liveService.summarizeAll) {
-      root.liveService.summarizeAll(ids)
-    } else {
-      // Fallback single
-      for (var j = 0; j < ids.length; j++) root.liveService.summarize(ids[j])
-    }
-  }
-
-  function openSummaryPopup() {
+  function openDescriptionPopup() {
     if (root.visibleRecs.length === 0) return
     var sel = root.visibleRecs[selectedIndex]
     if (!sel) return
     popupItem = sel
     popupTitle = sel.title || ""
-    if (sel.summary && sel.summary.length > 0) {
-      // Keep original description at the bottom as requested
-      var orig = sel.meta_description || sel.description || ""
-      if (orig && orig.length > 0) {
-        popupSummary = sel.summary + "\n\n— — —\nOriginal description:\n" + orig
-      } else {
-        popupSummary = sel.summary
-      }
-    } else if (sel.transcript_status === "working") {
-      popupSummary = "Summarizing… please wait. The summary will appear here when ready."
-    } else if (sel.description && sel.description.length > 0) {
-      popupSummary = sel.description
-      if (sel.meta_description && sel.meta_description.length > sel.description.length) {
-        popupSummary = sel.meta_description
-      }
-    } else if (sel.meta_description) {
-      popupSummary = sel.meta_description
-    } else {
-      popupSummary = "No description available. Press T to summarize via transcript."
-    }
-    showSummaryPopup = true
+    popupDescription = sel.meta_description || sel.description || "No description available."
+    showDescriptionPopup = true
     // Reset scroll to top when opening
     Qt.callLater(function() {
-      if (summaryFlick) summaryFlick.contentY = 0
+      if (descriptionFlick) descriptionFlick.contentY = 0
     })
   }
 
-  function closeSummaryPopup() {
-    showSummaryPopup = false
+  function closeDescriptionPopup() {
+    showDescriptionPopup = false
   }
 
-  function toggleSummaryPopup() {
-    if (showSummaryPopup) {
-      closeSummaryPopup()
+  function toggleDescriptionPopup() {
+    if (showDescriptionPopup) {
+      closeDescriptionPopup()
     } else {
-      openSummaryPopup()
+      openDescriptionPopup()
     }
   }
 
@@ -202,7 +149,7 @@ Panel {
     if (root.tabNames[index] === root.activeTag) return
     activeTag = root.tabNames[index]
     selectedIndex = 0
-    showSummaryPopup = false
+    showDescriptionPopup = false
   }
 
   function cycleTab(delta) {
@@ -282,13 +229,6 @@ Panel {
 
             Text {
               text: {
-                if (root.liveService && root.liveService.summarizing) {
-                  var t = root.liveService.summarizingItem
-                    ? (root.liveService.summarizingItem.title || "") : ""
-                  var q = root.liveService.summarizeQueue ? root.liveService.summarizeQueue.length : 0
-                  var queued = q > 0 ? " · " + q + " queued" : ""
-                  return "Summarizing" + (t ? ": " + t : "…") + queued + " — you can close this panel"
-                }
                 if (root.liveService && root.liveService.lastError !== "") return root.liveService.lastError
                 if (root.busy) {
                   var s = root.liveService ? root.liveService.state : null
@@ -634,41 +574,18 @@ Panel {
                   }
 
                   Text {
-                    text: {
-                      if (root.showingRecent) return ""
-                      var parts = []
-                      var mb = Model.matchBadge(recCard.modelData)
-                      if (mb !== "") parts.push(mb)
-                      var isQueued = root.liveService && root.liveService.summarizeQueue && root.liveService.summarizeQueue.indexOf(recCard.modelData.id) !== -1
-                      var isCurrent = root.liveService && root.liveService.currentSummarizeId === recCard.modelData.id
-                      if (recCard.modelData.summary) {
-                        parts.push("✓ summary ready [S]")
-                      } else if (isQueued) {
-                        var pos = root.liveService.summarizeQueue.indexOf(recCard.modelData.id) + 1
-                        parts.push("○ queued #" + pos)
-                      } else if (isCurrent || recCard.modelData.transcript_status === "working") {
-                        parts.push("◌ summarizing…")
-                      } else {
-                        var tb = Model.transcriptBadge(recCard.modelData)
-                        if (tb !== "") parts.push(tb)
-                      }
-                      return parts.join(" · ")
-                    }
+                    text: root.showingRecent ? "" : Model.matchBadge(recCard.modelData)
                     textFormat: Text.PlainText
                     visible: text !== ""
                     color: {
                       if (root.showingRecent) return Qt.darker(Color.foreground, 1.8)
-                      var isQ = root.liveService && root.liveService.summarizeQueue && root.liveService.summarizeQueue.indexOf(recCard.modelData.id) !== -1
-                      var isC = root.liveService && root.liveService.currentSummarizeId === recCard.modelData.id
-                      if (recCard.modelData.summary || recCard.modelData.transcript_status === "ready" || isQ || isC || Model.matchedItem(recCard.modelData)) return Color.accent
+                      if (Model.matchedItem(recCard.modelData)) return Color.accent
                       return Qt.darker(Color.foreground, 1.8)
                     }
                     font.family: Style.font.family
                     font.bold: {
                       if (root.showingRecent) return false
-                      var isQ2 = root.liveService && root.liveService.summarizeQueue && root.liveService.summarizeQueue.indexOf(recCard.modelData.id) !== -1
-                      var isC2 = root.liveService && root.liveService.currentSummarizeId === recCard.modelData.id
-                      return recCard.modelData.transcript_status === "ready" || !!recCard.modelData.summary || isQ2 || isC2 || Model.matchedItem(recCard.modelData)
+                      return Model.matchedItem(recCard.modelData)
                     }
                     font.pixelSize: Style.font.caption
                     elide: Text.ElideRight
@@ -723,7 +640,7 @@ Panel {
         // Footer keybindings bar — wraps instead of overflowing the panel
         Text {
           Layout.fillWidth: true
-          text: "R refresh  ·  Shift+R + recommended  ·  E edit tags  ·  T summarize  ·  Shift+T all in tag  ·  S description/summary  ·  o / Enter open  ·  j / k scroll or navigate  ·  ←/→ or 1-5 tabs  ·  Esc close"
+          text: "R refresh  ·  Shift+R + recommended  ·  E edit tags  ·  S description  ·  o / Enter open  ·  j / k scroll or navigate  ·  ←/→ or 1-5 tabs  ·  Esc close"
           textFormat: Text.PlainText
           color: Qt.darker(Color.foreground, 1.5)
           font.family: Style.font.family
@@ -733,11 +650,11 @@ Panel {
         }
       }
 
-      // Summary popup overlay
+      // Description popup overlay
       Rectangle {
-        id: summaryPopup
+        id: descriptionPopup
         anchors.fill: parent
-        visible: root.showSummaryPopup
+        visible: root.showDescriptionPopup
         color: Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 0.96)
         radius: Style.cornerRadius
         border.color: Color.accent
@@ -746,7 +663,7 @@ Panel {
         // Dismiss on outside click
         MouseArea {
           anchors.fill: parent
-          onClicked: root.closeSummaryPopup()
+          onClicked: root.closeDescriptionPopup()
         }
 
         ColumnLayout {
@@ -757,7 +674,7 @@ Panel {
           RowLayout {
             Layout.fillWidth: true
             Text {
-              text: "Summary"
+              text: "Description"
               textFormat: Text.PlainText
               color: Color.accent
               font.family: Style.font.family
@@ -788,30 +705,22 @@ Panel {
           }
 
           Flickable {
-            id: summaryFlick
+            id: descriptionFlick
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
-            contentHeight: summaryText.implicitHeight
+            contentHeight: descriptionText.implicitHeight
             contentWidth: width
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
             TextEdit {
-              id: summaryText
+              id: descriptionText
               width: parent.width
               textFormat: TextEdit.PlainText
-              // Live binding so summary appears automatically when ready
               text: {
                 var it = root.popupLiveItem
-                if (!it) return root.popupSummary
-                if (it.summary && it.summary.length > 0) {
-                  var orig = it.meta_description || it.description || ""
-                  return orig ? it.summary + "\n\n— — —\nOriginal description:\n" + orig : it.summary
-                }
-                if (it.transcript_status === "working") return "Summarizing… please wait. The summary will appear here when ready."
-                // Fallback to description/meta for plain S popup
-                if (root.popupSummary && root.popupSummary.length > 0) return root.popupSummary
+                if (!it) return root.popupDescription
                 return it.meta_description || it.description || "No description available."
               }
               readOnly: true
@@ -844,7 +753,7 @@ Panel {
               }
               MouseArea {
                 anchors.fill: parent
-                onClicked: root.closeSummaryPopup()
+                onClicked: root.closeDescriptionPopup()
                 cursorShape: Qt.PointingHandCursor
               }
             }
@@ -859,25 +768,25 @@ Panel {
       focus: true
       Keys.onPressed: function(event) {
         // Popup has priority
-        if (root.showSummaryPopup) {
+        if (root.showDescriptionPopup) {
           if (event.key === Qt.Key_Escape || event.text === "s" || event.text === "S") {
-            root.closeSummaryPopup()
+            root.closeDescriptionPopup()
             event.accepted = true
             return
           }
           // Allow Enter to also close popup
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            root.closeSummaryPopup()
+            root.closeDescriptionPopup()
             event.accepted = true
             return
           }
           if (event.key === Qt.Key_Down || event.text === "j" || event.text === "J") {
-            summaryFlick.contentY = Math.min(Math.max(0, summaryFlick.contentHeight - summaryFlick.height), summaryFlick.contentY + 60)
+            descriptionFlick.contentY = Math.min(Math.max(0, descriptionFlick.contentHeight - descriptionFlick.height), descriptionFlick.contentY + 60)
             event.accepted = true
             return
           }
           if (event.key === Qt.Key_Up || event.text === "k" || event.text === "K") {
-            summaryFlick.contentY = Math.max(0, summaryFlick.contentY - 60)
+            descriptionFlick.contentY = Math.max(0, descriptionFlick.contentY - 60)
             event.accepted = true
             return
           }
@@ -909,15 +818,8 @@ Panel {
         } else if (event.text === "r") {
           if (root.liveService && !root.liveService.busy) root.liveService.refresh()
           event.accepted = true
-        } else if (event.text === "T") {
-          // Shift+T: summarize all videos in current tag (not Others)
-          root.summarizeAllInTag()
-          event.accepted = true
-        } else if (event.text === "t") {
-          root.summarizeSelected()
-          event.accepted = true
         } else if (event.text === "s" || event.text === "S") {
-          root.toggleSummaryPopup()
+          root.toggleDescriptionPopup()
           event.accepted = true
         } else if (event.text === "e" || event.text === "E") {
           root.startEditingInterests()

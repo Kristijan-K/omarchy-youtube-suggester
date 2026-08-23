@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Kristijan K",
   "license": "MIT",
-  "description": "Scans your YouTube subscriptions (last 24h) + optional Recommended, classifies by your tags, shows all per-tag + Others sorted by popularity, with transcript summarization via your default coding agent.",
+  "description": "Scans your YouTube subscriptions (last 24h) + optional Recommended, classifies by your tags, and shows all per-tag + Others sorted by popularity with plain-text descriptions.",
   "kinds": ["service", "bar-widget"],
   "keepLoaded": true,
   "entryPoints": {
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "YouTube Suggester",
-    "description": "Last 24h subs filtered by tags + Others, with on-demand AI summaries. Shift+R adds 20 Recommended.",
+    "description": "Last 24h subscriptions filtered by tags + Others with descriptions. Shift+R adds 20 Recommended.",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",

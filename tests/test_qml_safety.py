@@ -65,26 +65,27 @@ def test_popup_title_uses_plain_text():
     assert found, "Could not find Text block rendering root.popupTitle — has the QML been refactored?"
 
 
-def test_summary_textedit_uses_plain_text():
+def test_description_textedit_uses_plain_text():
+    """The description popup must render remote content as plain text."""
     qml = QML_PATH.read_text(encoding="utf-8")
     found = False
     for line_no, block in parse_qml_text_blocks(qml):
-        if "id: summaryText" in block:
+        if "id: descriptionText" in block:
             found = True
             assert "TextEdit.PlainText" in block or "Text.PlainText" in block, (
-                f"summaryText TextEdit at L{line_no} must use textFormat: TextEdit.PlainText; block:\n{block[:600]}"
+                f"descriptionText TextEdit at L{line_no} must use textFormat: TextEdit.PlainText; block:\n{block[:600]}"
             )
             break
-    assert found, "Could not find TextEdit id: summaryText"
+    assert found, "Could not find TextEdit id: descriptionText"
 
 
 def test_no_rich_text_on_untrusted_fields():
-    """Ensure no Text rendering title/description/summary uses RichText."""
+    """Ensure no Text rendering title or description uses RichText."""
     qml = QML_PATH.read_text(encoding="utf-8")
     for line_no, block in parse_qml_text_blocks(qml):
         lower = block.lower()
         # If block renders untrusted fields, it must not use RichText/StyledText/AutoText
-        untrusted_tokens = ("popuptitle", "modeldata.title", "modeldata.description", "summary", "meta_description")
+        untrusted_tokens = ("popuptitle", "modeldata.title", "modeldata.description", "meta_description")
         if any(tok in lower for tok in untrusted_tokens):
             assert "RichText" not in block, f"L{line_no} renders untrusted data with RichText: {block[:300]}"
             assert "StyledText" not in block

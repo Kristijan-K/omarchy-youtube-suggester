@@ -17,7 +17,6 @@ Item {
   property var interests: Model.interests(state)
   property var recent: Model.recent(state)
   property int candidatesSeen: state.candidates_seen || 0
-  property int transcribed: state.transcribed || 0
   property int watchedCount: state.watched_count || 0
   property string lastError: state.error || ""
   property string updatedAt: state.updated_at || ""
@@ -49,52 +48,6 @@ Item {
     openProcess.command = [engineScript, "open", videoId]
     openProcess.running = true
   }
-
-  property var summarizeQueue: []
-  property string currentSummarizeId: ""
-
-  function summarize(videoId) {
-    if (!videoId) return
-    if (videoId === currentSummarizeId) return
-    if (summarizeQueue.indexOf(videoId) !== -1) return
-    if (summarizeProcess.running) {
-      summarizeQueue.push(videoId)
-      return
-    }
-    currentSummarizeId = videoId
-    summarizeProcess.command = [engineScript, "summarize", videoId]
-    summarizeProcess.running = true
-  }
-
-  function summarizeAll(videoIds) {
-    if (!videoIds || videoIds.length === 0) return
-    for (var i = 0; i < videoIds.length; i++) {
-      var id = videoIds[i]
-      if (id !== currentSummarizeId && summarizeQueue.indexOf(id) === -1) {
-        summarizeQueue.push(id)
-      }
-    }
-    if (!summarizeProcess.running && summarizeQueue.length > 0) {
-      var next = summarizeQueue.shift()
-      currentSummarizeId = next
-      summarizeProcess.command = [engineScript, "summarize", next]
-      summarizeProcess.running = true
-    }
-  }
-
-  function _processNextSummarize() {
-    if (summarizeQueue.length > 0 && !summarizeProcess.running) {
-      var nxt = summarizeQueue.shift()
-      currentSummarizeId = nxt
-      summarizeProcess.command = [engineScript, "summarize", nxt]
-      summarizeProcess.running = true
-    } else if (summarizeQueue.length === 0) {
-      currentSummarizeId = ""
-    }
-  }
-
-  readonly property bool summarizing: summarizeProcess.running || summarizeQueue.length > 0
-  readonly property var summarizingItem: state.transcribing || null
 
   function saveInterests(keywords) {
     if (configProcess.running) return
@@ -146,7 +99,6 @@ Item {
             recommendations: root.recommendations,
             recent: root.recent,
             candidates_seen: root.candidatesSeen,
-            transcribed: root.transcribed,
             watched_count: root.watchedCount,
             updated_at: new Date().toISOString().slice(0,19)
           }
@@ -173,23 +125,6 @@ Item {
     onExited: function(exitCode) {
       if (exitCode === 0) root.loadStatus() // refresh recent; opened videos stay visible until next R
     }
-  }
-
-  Process {
-    id: summarizeProcess
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(exitCode) {
-      root.loadStatus() // pick up the finished summary
-      Qt.callLater(function() { root._processNextSummarize() })
-    }
-  }
-
-  // While a background summary runs, keep the panel state fresh.
-  Timer {
-    interval: 1500
-    repeat: true
-    running: root.summarizing
-    onTriggered: root.loadStatus()
   }
 
   Process {
