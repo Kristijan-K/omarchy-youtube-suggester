@@ -776,7 +776,20 @@ def describe(transcript, keywords, max_chars=320):
     """Extractive summary: the most keyword-relevant sentences, in order."""
     if not transcript:
         return ""
-    sentences = split_sentences(transcript)[:400]
+    # Strip caption stage directions ([music], [applause], [laughter], etc.) and
+    # speaker markers (>>) that otherwise pollute keyword matching - e.g. a
+    # video with interest "Music" would otherwise rank "[music]" cues as
+    # relevant and produce summaries like "[music] >> Well, welcome.".
+    cleaned = re.sub(r"\[.*?\]", "", transcript)
+    cleaned = re.sub(r">>\s*", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        cleaned = transcript
+    sentences = split_sentences(cleaned)[:400]
+    # Drop empty / very short noise sentences left after stripping
+    sentences = [s for s in sentences if len(s) >= 20]
+    if not sentences:
+        sentences = split_sentences(transcript)[:400]
     scored = []
     for idx, sent in enumerate(sentences):
         lower = sent.lower()
