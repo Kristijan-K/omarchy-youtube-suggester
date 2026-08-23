@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 import re
+import selectors
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -88,6 +90,185 @@ CHROMIUM_BROWSERS = {
 }
 
 COOKIES_FILE = CACHE_DIR / "cookies.txt"
+
+MAX_PERSISTED_JSON_BYTES = 1024 * 1024
+MAX_STATE_BYTES = 1024 * 1024
+MAX_SUBPROCESS_STDOUT_BYTES = 4 * 1024 * 1024
+MAX_SUBPROCESS_STDERR_BYTES = 64 * 1024
+MAX_TITLE_CHARS = 500
+MAX_CHANNEL_CHARS = 200
+MAX_DESCRIPTION_CHARS = 4000
+MAX_TAG_CHARS = 100
+MAX_TAGS = 12
+MAX_STATE_RECORDS = 300
+MAX_SEEN_IDS = 5000
+MAX_DETAIL_CHARS = 500
+MAX_ERROR_CHARS = 2000
+
+
+def _clip_text(value, max_chars, default=""):
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        value = str(value)
+    return value[:max_chars]
+
+
+def _bounded_int(value, default, minimum, maximum):
+    try:
+        if isinstance(value, str):
+            value = value[:32]
+        return max(minimum, min(maximum, int(value)))
+    except (OverflowError, TypeError, ValueError):
+        return default
+
+
+def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
+                stderr_limit=MAX_SUBPROCESS_STDERR_BYTES):
+    """Run a child while draining both pipes into fixed-size buffers."""
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    limited = False
+    stopped = False
+    deadline = time.monotonic() + timeout
+
+    def stop_process():
+        nonlocal stopped
+        if stopped:
+            return
+        stopped = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+    try:
+        while selector.get_map():
+            if stopped:
+                wait = 0.1
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    limited = True
+                    stop_process()
+                    continue
+                wait = remaining
+            events = selector.select(wait)
+            if not events:
+                if not stopped:
+                    limited = True
+                    stop_process()
+                continue
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 65536)
+                except OSError:
+                    selector.unregister(key.fileobj)
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream = key.data
+                remaining = limits[stream] - len(buffers[stream])
+                if len(chunk) > remaining:
+                    if remaining > 0:
+                        buffers[stream].extend(chunk[:remaining])
+                    limited = True
+                    stop_process()
+                else:
+                    buffers[stream].extend(chunk)
+        returncode = process.wait()
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+    result = subprocess.CompletedProcess(
+        cmd,
+        returncode,
+        stdout=bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
+        stderr=bytes(buffers["stderr"]).decode("utf-8", errors="replace"),
+    )
+    return result, limited
+
+
+def _bounded_string_list(value, limit, max_chars):
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        _clip_text(item, max_chars)
+        for item in value[:limit]
+        if item is not None
+    ]
+
+
+def _bounded_tags(value):
+    return [tag for tag in _bounded_string_list(value, MAX_TAGS, MAX_TAG_CHARS) if tag]
+
+
+def _bounded_item(item):
+    """Keep only the bounded fields the QML UI can render."""
+    if not isinstance(item, dict):
+        return None
+    scores = item.get("keyword_scores")
+    bounded_scores = {}
+    if isinstance(scores, dict):
+        for index, (key, value) in enumerate(scores.items()):
+            if index >= MAX_TAGS:
+                break
+            key = _clip_text(key, MAX_TAG_CHARS)
+            if key:
+                bounded_scores[key] = _bounded_int(value, 0, 0, 10**9)
+    return {
+        "id": _clip_text(item.get("id"), 32),
+        "title": _clip_text(item.get("title"), MAX_TITLE_CHARS, "(untitled)"),
+        "channel": _clip_text(item.get("channel"), MAX_CHANNEL_CHARS, "YouTube"),
+        "duration": _bounded_int(item.get("duration"), 0, 0, 10**7),
+        "duration_formatted": _clip_text(item.get("duration_formatted"), 32, "?"),
+        "views": _bounded_int(item.get("views"), 0, 0, 10**18),
+        "score": _bounded_int(item.get("score"), 0, 0, 10**9),
+        "matched": _bounded_string_list(item.get("matched"), MAX_TAGS, MAX_TAG_CHARS),
+        "keyword_scores": bounded_scores,
+        "meta_description": _clip_text(
+            item.get("meta_description"), MAX_DESCRIPTION_CHARS
+        ),
+        "tags": _bounded_tags(item.get("tags")),
+        "thumbnail": _clip_text(item.get("thumbnail"), 500),
+        "url": _clip_text(item.get("url"), 500),
+        "description": _clip_text(item.get("description"), MAX_DESCRIPTION_CHARS),
+        "tag": _clip_text(item.get("tag"), MAX_TAG_CHARS),
+        "source": _clip_text(item.get("source"), 16),
+        "uploaded_at": _bounded_int(item.get("uploaded_at"), 0, 0, 10**12),
+        "age_label": _clip_text(item.get("age_label"), 32),
+        "views_per_hour": _bounded_int(item.get("views_per_hour"), 0, 0, 10**15),
+        "opened_at": _clip_text(item.get("opened_at"), 64),
+    }
+
+
+def _bounded_items(value, limit):
+    if not isinstance(value, list):
+        return []
+    items = []
+    for item in value[:limit]:
+        bounded = _bounded_item(item)
+        if bounded is not None:
+            items.append(bounded)
+    return items
 
 
 def _pbkdf2_key(password, length=16):
@@ -244,24 +425,51 @@ def ensure_dirs():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_json(path, default):
+def load_json(path, default, max_bytes=MAX_PERSISTED_JSON_BYTES):
+    """Read at most one bounded JSON document before parsing it."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
+        with open(path, "rb") as fh:
+            raw = fh.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return default
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, TypeError):
         return default
 
 
-def atomic_write_json(path, data):
+def _json_bytes(data, indent=None):
+    separators = None if indent is not None else (",", ":")
+    return json.dumps(
+        data,
+        ensure_ascii=True,
+        indent=indent,
+        separators=separators,
+    ).encode("utf-8")
+
+
+def emit_json(data, max_bytes=MAX_PERSISTED_JSON_BYTES):
+    payload = _json_bytes(data)
+    if len(payload) > max_bytes:
+        raise ValueError("JSON output exceeds the configured size limit")
+    print(payload.decode("utf-8"), flush=True)
+
+
+def atomic_write_json(path, data, max_bytes=MAX_PERSISTED_JSON_BYTES):
+    payload = _json_bytes(data, indent=2)
+    if len(payload) > max_bytes:
+        raise ValueError("JSON state exceeds the configured size limit")
+    path = Path(path)
     tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
     os.replace(tmp, path)
 
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    cfg.update(load_json(CONFIG_FILE, {}))
+    stored = load_json(CONFIG_FILE, {})
+    if isinstance(stored, dict):
+        cfg.update(stored)
     for removed in (
         "transcribe_whisper",
         "whisper_model",
@@ -270,6 +478,21 @@ def load_config():
         "enable_ai_summary",
     ):
         cfg.pop(removed, None)
+    interests = cfg.get("interests", DEFAULT_CONFIG["interests"])
+    if not isinstance(interests, (list, tuple)):
+        interests = DEFAULT_CONFIG["interests"]
+    cfg["interests"] = [
+        keyword
+        for keyword in _bounded_string_list(interests, 5, MAX_TAG_CHARS)
+        if keyword.strip()
+    ]
+    cfg["browser"] = _clip_text(cfg.get("browser"), 32, DEFAULT_CONFIG["browser"])
+    cfg["feed_limit"] = _bounded_int(cfg.get("feed_limit"), 120, 1, 500)
+    cfg["account_history_limit"] = _bounded_int(
+        cfg.get("account_history_limit"), 200, 1, 1000
+    )
+    cfg["max_candidates"] = _bounded_int(cfg.get("max_candidates"), 60, 1, 60)
+    cfg["metadata_workers"] = _bounded_int(cfg.get("metadata_workers"), 4, 1, 8)
     return cfg
 
 
@@ -280,24 +503,48 @@ def save_config(cfg):
 
 def load_seen():
     data = load_json(SEEN_FILE, {})
-    return set(data.get("ids", []))
+    ids = data.get("ids", []) if isinstance(data, dict) else []
+    if not isinstance(ids, list):
+        return set()
+    return {
+        video_id
+        for video_id in ids[:MAX_SEEN_IDS]
+        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+    }
 
 
 def save_seen(seen):
     ensure_dirs()
-    atomic_write_json(SEEN_FILE, {"ids": sorted(seen)})
+    ids = sorted(
+        video_id
+        for video_id in seen
+        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+    )[-MAX_SEEN_IDS:]
+    atomic_write_json(SEEN_FILE, {"ids": ids})
 
 
 def load_dismissed():
     data = load_json(DISMISSED_FILE, {})
-    ids = data.get("ids", [])
+    ids = data.get("ids", []) if isinstance(data, dict) else []
+    if not isinstance(ids, list):
+        ids = []
+    ids = [
+        video_id
+        for video_id in ids[-MAX_SEEN_IDS:]
+        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+    ]
     return set(ids), ids
 
 
 def save_dismissed(dismissed_ids):
     """Persist dismissed video ids in dismissal order (oldest trimmed first)."""
     ensure_dirs()
-    atomic_write_json(DISMISSED_FILE, {"ids": list(dismissed_ids)[-500:]})
+    ids = [
+        video_id
+        for video_id in list(dismissed_ids)[-MAX_SEEN_IDS:]
+        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+    ]
+    atomic_write_json(DISMISSED_FILE, {"ids": ids})
 
 
 RECENT_FILE = CACHE_DIR / "recent.json"
@@ -306,13 +553,14 @@ RECENT_LIMIT = 5
 
 def load_recent():
     data = load_json(RECENT_FILE, {})
-    return data.get("videos", [])
+    videos = data.get("videos", []) if isinstance(data, dict) else []
+    return _bounded_items(videos, RECENT_LIMIT)
 
 
 def remember_recent(video):
     """Track the last videos opened through the plugin (newest first)."""
     videos = [v for v in load_recent() if v.get("id") != video.get("id")]
-    videos.insert(0, video)
+    videos.insert(0, _bounded_item(video))
     atomic_write_json(RECENT_FILE, {"videos": videos[:RECENT_LIMIT]})
 
 
@@ -334,11 +582,88 @@ def new_state(stage="idle", **extra):
     return state
 
 
+def _state_payload_size(state):
+    return len(_json_bytes(state, indent=2))
+
+
+def _fit_state_size(state):
+    """Trim optional state data until the indented persisted form fits."""
+    if _state_payload_size(state) <= MAX_STATE_BYTES:
+        return state
+
+    records = state["recommendations"] + state["pool"]
+    for item in records:
+        item["meta_description"] = item["meta_description"][:1024]
+        item["description"] = item["description"][:320]
+        item["tags"] = []
+        item["keyword_scores"] = {}
+    if _state_payload_size(state) <= MAX_STATE_BYTES:
+        return state
+
+    # The pool is an internal ranking detail; recommendations and recent are
+    # the only collections consumed by the UI.
+    state["pool"] = []
+    if _state_payload_size(state) <= MAX_STATE_BYTES:
+        return state
+
+    recommendations = state["recommendations"]
+    while recommendations and _state_payload_size(state) > MAX_STATE_BYTES:
+        keep = max(0, len(recommendations) // 2)
+        del recommendations[keep:]
+    if _state_payload_size(state) <= MAX_STATE_BYTES:
+        return state
+
+    # This is a last-resort guard for hostile legacy state with unusually
+    # large scalar values or record keys.
+    state["recommendations"] = []
+    state["recent"] = []
+    return state
+
+
+def bound_state(state):
+    """Sanitize state loaded from disk or received from remote metadata."""
+    if not isinstance(state, dict):
+        state = {}
+    progress = state.get("progress")
+    if not isinstance(progress, dict):
+        progress = {}
+    safe = {
+        "stage": _clip_text(state.get("stage"), 32, "idle"),
+        "detail": _clip_text(state.get("detail"), MAX_DETAIL_CHARS),
+        "progress": {
+            "done": _bounded_int(progress.get("done"), 0, 0, 100000),
+            "total": _bounded_int(progress.get("total"), 0, 0, 100000),
+        },
+        "interests": [
+            keyword
+            for keyword in _bounded_string_list(
+                state.get("interests"), 5, MAX_TAG_CHARS
+            )
+            if keyword.strip()
+        ],
+        "recommendations": _bounded_items(
+            state.get("recommendations"), MAX_STATE_RECORDS
+        ),
+        "pool": _bounded_items(state.get("pool"), MAX_STATE_RECORDS),
+        "recent": _bounded_items(state.get("recent"), RECENT_LIMIT),
+        "candidates_seen": _bounded_int(
+            state.get("candidates_seen"), 0, 0, 100000
+        ),
+        "watched_count": _bounded_int(state.get("watched_count"), 0, 0, 1000000),
+        "error": _clip_text(state.get("error"), MAX_ERROR_CHARS),
+        "updated_at": _clip_text(state.get("updated_at"), 64),
+    }
+    return _fit_state_size(safe)
+
+
 def publish_state(state):
     """Persist and stream the current state."""
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    atomic_write_json(STATE_FILE, state)
-    print(json.dumps(state), flush=True)
+    safe = bound_state(state)
+    state.clear()
+    state.update(safe)
+    atomic_write_json(STATE_FILE, state, max_bytes=MAX_STATE_BYTES)
+    emit_json(state, max_bytes=MAX_STATE_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +728,7 @@ def fetch_account_history_ids(cfg):
     Catches videos watched on other devices; requires working cookies and
     history being enabled on the account.
     """
-    limit = int(cfg.get("account_history_limit", 200))
+    limit = _bounded_int(cfg.get("account_history_limit"), 200, 1, 1000)
     cmd = [
         "yt-dlp",
         *cookie_args(cfg.get("browser")),
@@ -418,11 +743,13 @@ def fetch_account_history_ids(cfg):
     ]
     ids = set()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc, _limited = run_bounded(cmd, timeout=120)
         for line in proc.stdout.splitlines():
             vid = line.strip()
             if re.fullmatch(r"[\w-]{11}", vid):
                 ids.add(vid)
+                if len(ids) >= limit:
+                    break
     except Exception:
         pass
     return ids
@@ -457,7 +784,7 @@ def cookie_args(browser):
 
 def fetch_feed(cfg):
     """Return raw entries from the logged-in subscriptions feed."""
-    feed_limit = int(cfg.get("feed_limit", 120))
+    feed_limit = _bounded_int(cfg.get("feed_limit"), 120, 1, 500)
     cmd = [
         "yt-dlp",
         *cookie_args(cfg.get("browser")),
@@ -469,7 +796,7 @@ def fetch_feed(cfg):
         "--dump-json",
         "https://www.youtube.com/feed/subscriptions",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    proc, limited = run_bounded(cmd, timeout=240)
     entries = []
     for line in proc.stdout.splitlines():
         line = line.strip()
@@ -479,31 +806,38 @@ def fetch_feed(cfg):
             data = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(data, dict):
+            continue
         vid = data.get("id") or ""
-        if not re.fullmatch(r"[\w-]{11}", vid):
+        if not isinstance(vid, str) or not re.fullmatch(r"[\w-]{11}", vid):
             continue
 
         def num(value):
-            try:
-                return int(float(value))
-            except (TypeError, ValueError):
-                return 0
+            return _bounded_int(value, 0, 0, 10**18)
 
         entries.append(
             {
                 "id": vid,
-                "title": data.get("title") or "(untitled)",
-                "channel": data.get("channel")
-                or data.get("uploader")
-                or "YouTube",
+                "title": _clip_text(
+                    data.get("title"), MAX_TITLE_CHARS, "(untitled)"
+                ),
+                "channel": _clip_text(
+                    data.get("channel") or data.get("uploader"),
+                    MAX_CHANNEL_CHARS,
+                    "YouTube",
+                ),
                 "duration": num(data.get("duration")),
                 "views": num(data.get("view_count")),
             }
         )
+        if len(entries) >= feed_limit:
+            break
     if not entries and proc.returncode != 0:
         raise RuntimeError(
             "yt-dlp returned no feed entries: "
-            + (proc.stderr.strip().splitlines() or ["unknown error"])[-1][:200]
+            + (proc.stderr.strip().splitlines() or [
+                "output limit reached" if limited else "unknown error"
+            ])[-1][:200]
         )
     return entries
 
@@ -515,7 +849,7 @@ def fetch_recommended(cfg, limit=None):
     failure (e.g., not logged in or feed empty) so the caller can fall back
     to subscriptions only.
     """
-    feed_limit = int(limit or cfg.get("feed_limit", 120))
+    feed_limit = _bounded_int(limit or cfg.get("feed_limit"), 120, 1, 500)
     # Both URLs are tried; yt-dlp maps them to youtube:recommended extractor.
     for url in (
         "https://www.youtube.com/feed/recommended",
@@ -532,7 +866,7 @@ def fetch_recommended(cfg, limit=None):
             "--dump-json",
             url,
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        proc, _limited = run_bounded(cmd, timeout=240)
         entries = []
         for line in proc.stdout.splitlines():
             line = line.strip()
@@ -542,27 +876,32 @@ def fetch_recommended(cfg, limit=None):
                 data = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(data, dict):
+                continue
             vid = data.get("id") or ""
-            if not re.fullmatch(r"[\w-]{11}", vid):
+            if not isinstance(vid, str) or not re.fullmatch(r"[\w-]{11}", vid):
                 continue
 
             def num(value):
-                try:
-                    return int(float(value))
-                except (TypeError, ValueError):
-                    return 0
+                return _bounded_int(value, 0, 0, 10**18)
 
             entries.append(
                 {
                     "id": vid,
-                    "title": data.get("title") or "(untitled)",
-                    "channel": data.get("channel")
-                    or data.get("uploader")
-                    or "YouTube",
+                    "title": _clip_text(
+                        data.get("title"), MAX_TITLE_CHARS, "(untitled)"
+                    ),
+                    "channel": _clip_text(
+                        data.get("channel") or data.get("uploader"),
+                        MAX_CHANNEL_CHARS,
+                        "YouTube",
+                    ),
                     "duration": num(data.get("duration")),
                     "views": num(data.get("view_count")),
                 }
             )
+            if len(entries) >= feed_limit:
+                break
         if entries:
             return entries
         # If first URL gave nothing but succeeded, try next URL
@@ -586,13 +925,28 @@ def fetch_metadata(cfg, video_id):
         "--dump-json",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    proc, _limited = run_bounded(cmd, timeout=60)
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
             continue
         try:
-            return json.loads(line)
+            data = json.loads(line)
+            if not isinstance(data, dict):
+                continue
+            return {
+                "tags": _bounded_tags(data.get("tags")),
+                "description": _clip_text(
+                    data.get("description"), MAX_DESCRIPTION_CHARS
+                ),
+                "view_count": _bounded_int(
+                    data.get("view_count"), 0, 0, 10**18
+                ),
+                "timestamp": _bounded_int(
+                    data.get("timestamp"), 0, 0, 10**12
+                ),
+                "upload_date": _clip_text(data.get("upload_date"), 8),
+            }
         except ValueError:
             continue
     return None
@@ -673,8 +1027,15 @@ def format_duration(seconds):
 
 
 def _base_item(entry, meta, interests):
-    tags = (meta or {}).get("tags") or []
-    description = (meta or {}).get("description") or ""
+    tags = _bounded_tags((meta or {}).get("tags"))
+    description = _clip_text(
+        (meta or {}).get("description"), MAX_DESCRIPTION_CHARS
+    )
+    entry = dict(entry)
+    entry["title"] = _clip_text(entry.get("title"), MAX_TITLE_CHARS, "(untitled)")
+    entry["channel"] = _clip_text(
+        entry.get("channel"), MAX_CHANNEL_CHARS, "YouTube"
+    )
     score, matched, per_keyword = score_metadata(
         entry["title"], tags, description, interests
     )
@@ -685,7 +1046,7 @@ def _base_item(entry, meta, interests):
         "matched": matched,
         "keyword_scores": per_keyword,
         "meta_description": description,
-        "tags": tags[:12],
+        "tags": tags,
         "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
         "url": f"https://www.youtube.com/watch?v={entry['id']}",
         "description": "",
@@ -874,7 +1235,7 @@ def run_pipeline(limit=None, include_recommended=False):
     try:
         pool = [None] * len(candidates)
         completed = 0
-        workers = max(1, int(cfg.get("metadata_workers", 4)))
+        workers = _bounded_int(cfg.get("metadata_workers"), 4, 1, 8)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             future_map = {ex.submit(_meta_job, e): i for i, e in enumerate(candidates)}
             for fut in as_completed(future_map):
@@ -902,7 +1263,9 @@ def run_pipeline(limit=None, include_recommended=False):
                         "score": 0,
                         "matched": [],
                         "keyword_scores": {},
-                        "meta_description": (meta or {}).get("description") or "",
+                        "meta_description": _clip_text(
+                            (meta or {}).get("description"), MAX_DESCRIPTION_CHARS
+                        ),
                         "tags": [],
                         "thumbnail": f"https://i.ytimg.com/vi/{entry['id']}/mqdefault.jpg",
                         "url": f"https://www.youtube.com/watch?v={entry['id']}",
@@ -993,24 +1356,28 @@ def run_pipeline(limit=None, include_recommended=False):
 
 def cmd_status(_args):
     cfg = load_config()
-    state = load_json(STATE_FILE, new_state())
+    state = bound_state(load_json(STATE_FILE, new_state()))
     # Always surface the currently configured tags, even before a run.
-    state["interests"] = [k for k in cfg.get("interests", []) if k.strip()]
+    state["interests"] = cfg["interests"]
     state.setdefault("recent", load_recent())
-    print(json.dumps(state), flush=True)
+    state = bound_state(state)
+    emit_json(state, max_bytes=MAX_STATE_BYTES)
 
 
 def cmd_watch(_args):
     """Stream state file changes as JSON lines (used by tooling/debugging)."""
     ensure_dirs()
     last_mtime = None
-    print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+    emit_json(bound_state(load_json(STATE_FILE, new_state())), max_bytes=MAX_STATE_BYTES)
     while True:
         try:
             mtime = STATE_FILE.stat().st_mtime
             if mtime != last_mtime:
                 last_mtime = mtime
-                print(json.dumps(load_json(STATE_FILE, new_state())), flush=True)
+                emit_json(
+                    bound_state(load_json(STATE_FILE, new_state())),
+                    max_bytes=MAX_STATE_BYTES,
+                )
         except OSError:
             pass
         time.sleep(1.5)
@@ -1018,12 +1385,14 @@ def cmd_watch(_args):
 
 def cmd_open(args):
     vid = args.video_id
+    if not re.fullmatch(r"[\w-]{11}", vid):
+        raise SystemExit("invalid YouTube video id")
     seen = load_seen()
     seen.add(vid)
     save_seen(seen)
     url = f"https://www.youtube.com/watch?v={vid}"
 
-    state = load_json(STATE_FILE, {})
+    state = bound_state(load_json(STATE_FILE, {}))
     info = {}
     for pool in (state.get("recommendations") or [], state.get("recent") or []):
         for item in pool:
@@ -1045,7 +1414,9 @@ def cmd_open(args):
     # Keep the published state's recent list in sync for the UI.
     if state:
         state["recent"] = load_recent()
-        atomic_write_json(STATE_FILE, state)
+        atomic_write_json(
+            STATE_FILE, bound_state(state), max_bytes=MAX_STATE_BYTES
+        )
 
     # Same as Super+Shift+Y: omarchy-launch-webapp does `uwsm-app -- <browser> --app=URL`
     try:
@@ -1061,35 +1432,39 @@ def cmd_open(args):
             webbrowser.open(url)
         except Exception:
             pass
-    print(json.dumps({"opened": vid, "url": url}), flush=True)
+    emit_json({"opened": vid, "url": url})
 
 
 def cmd_config(args):
     if args.action == "get":
-        print(json.dumps(load_config()), flush=True)
+        emit_json(load_config())
         return
     cfg = load_config()
     if args.interests is not None:
         cfg["interests"] = [
-            k.strip() for k in args.interests.split(",") if k.strip()
+            _clip_text(k.strip(), MAX_TAG_CHARS)
+            for k in args.interests.split(",")
+            if k.strip()
         ][:5]
         # Sync the saved tags into the published state so the UI reflects
         # the change immediately (the old state file kept stale tags).
-        state = load_json(STATE_FILE, {})
+        state = bound_state(load_json(STATE_FILE, {}))
         if state:
             state["interests"] = cfg["interests"]
-            atomic_write_json(STATE_FILE, state)
+            atomic_write_json(
+                STATE_FILE, bound_state(state), max_bytes=MAX_STATE_BYTES
+            )
     if args.browser:
-        cfg["browser"] = args.browser
+        cfg["browser"] = _clip_text(args.browser, 32)
     if args.max_candidates:
-        cfg["max_candidates"] = max(1, args.max_candidates)
+        cfg["max_candidates"] = _bounded_int(args.max_candidates, 60, 1, 60)
     save_config(cfg)
-    print(json.dumps(cfg), flush=True)
+    emit_json(cfg)
 
 
 def cmd_history(_args):
     ids = collect_browser_history_ids()
-    print(json.dumps({"watched": len(ids), "sample": sorted(ids)[:20]}), flush=True)
+    emit_json({"watched": len(ids), "sample": sorted(ids)[:20]})
 
 
 def cmd_feed(args):
@@ -1098,16 +1473,12 @@ def cmd_feed(args):
     watched = collect_browser_history_ids() | load_seen()
     fresh = [e for e in entries if e["id"] not in watched]
     limit = args.limit or cfg.get("max_candidates", 15)
-    print(
-        json.dumps(
-            {
-                "feed_size": len(entries),
-                "unwatched": len(fresh),
-                "candidates": fresh[:limit],
-            },
-            indent=2,
-        ),
-        flush=True,
+    emit_json(
+        {
+            "feed_size": len(entries),
+            "unwatched": len(fresh),
+            "candidates": fresh[:limit],
+        }
     )
 
 

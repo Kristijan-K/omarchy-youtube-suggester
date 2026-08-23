@@ -21,6 +21,17 @@ Item {
   property string lastError: state.error || ""
   property string updatedAt: state.updated_at || ""
   property bool busy: Model.isBusy(stage)
+  property string runErrorOutput: ""
+  property string statusOutputText: ""
+  readonly property int maxStatusOutputChars: 1024 * 1024
+  readonly property int maxErrorOutputChars: 8192
+
+  function appendBoundedOutput(current, data, limit) {
+    var prefix = current || ""
+    if (prefix.length >= limit) return prefix
+    var next = prefix + (prefix.length > 0 ? "\n" : "") + String(data || "")
+    return next.slice(0, limit)
+  }
 
   readonly property string engineScript: {
     var raw = Qt.resolvedUrl("bin/omarchy-youtube-suggester").toString()
@@ -32,6 +43,7 @@ Item {
   function refresh() {
     if (runProcess.running) return
     lastError = ""
+    runErrorOutput = ""
     runProcess.command = [engineScript, "run"]
     runProcess.running = true
   }
@@ -39,6 +51,7 @@ Item {
   function refreshWithRecommended() {
     if (runProcess.running) return
     lastError = ""
+    runErrorOutput = ""
     runProcess.command = [engineScript, "run", "--with-recommended"]
     runProcess.running = true
   }
@@ -57,6 +70,7 @@ Item {
 
   function loadStatus() {
     if (statusProcess.running) return
+    statusOutputText = ""
     statusProcess.command = [engineScript, "status"]
     statusProcess.running = true
   }
@@ -79,10 +93,18 @@ Item {
         root.applyState(Model.parseState(data))
       }
     }
-    stderr: StdioCollector { id: runError; waitForEnd: true }
+    stderr: SplitParser {
+      onRead: function(data) {
+        root.runErrorOutput = root.appendBoundedOutput(
+          root.runErrorOutput,
+          data,
+          root.maxErrorOutputChars
+        )
+      }
+    }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
-        var msg = String(runError.text || "Pipeline failed (exit " + exitCode + ")").trim()
+        var msg = String(root.runErrorOutput || "Pipeline failed (exit " + exitCode + ")").trim()
         if (!msg) msg = "Pipeline failed"
         root.lastError = msg
         root.runFinished(false, msg)
@@ -111,17 +133,25 @@ Item {
 
   Process {
     id: statusProcess
-    stdout: StdioCollector { id: statusOutput; waitForEnd: true }
+    stdout: SplitParser {
+      onRead: function(data) {
+        root.statusOutputText = root.appendBoundedOutput(
+          root.statusOutputText,
+          data,
+          root.maxStatusOutputChars
+        )
+      }
+    }
     onExited: function(exitCode) {
       if (exitCode === 0 && !root.busy) {
-        root.applyState(Model.parseState(statusOutput.text))
+        root.applyState(Model.parseState(root.statusOutputText))
       }
     }
   }
 
   Process {
     id: openProcess
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser { onRead: function(_data) {} }
     onExited: function(exitCode) {
       if (exitCode === 0) root.loadStatus() // refresh recent; opened videos stay visible until next R
     }
@@ -129,7 +159,7 @@ Item {
 
   Process {
     id: configProcess
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: SplitParser { onRead: function(_data) {} }
     onExited: function(exitCode) {
       if (exitCode === 0) {
         root.loadStatus()
