@@ -47,6 +47,40 @@ def test_persisted_json_is_rejected_before_unbounded_parse(tmp_path):
     assert engine.load_json(path, {"safe": True}) == {"safe": True}
 
 
+def test_persisted_json_requires_owned_regular_file(tmp_path, monkeypatch):
+    engine = load_engine()
+    default = {"safe": True}
+
+    target = tmp_path / "target.json"
+    target.write_text('{"unsafe": true}', encoding="utf-8")
+    symlink = tmp_path / "symlink.json"
+    symlink.symlink_to(target)
+    assert engine.load_json(symlink, default) == default
+
+    fifo = tmp_path / "state.fifo"
+    os.mkfifo(fifo)
+    assert engine.load_json(fifo, default) == default
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(engine.os, "getuid", lambda: real_uid + 1)
+    assert engine.load_json(target, default) == default
+
+
+def test_atomic_json_write_ignores_predictable_temp_symlink(tmp_path):
+    engine = load_engine()
+    path = tmp_path / "state.json"
+    redirected = tmp_path / "redirected.json"
+    redirected.write_text("keep-me", encoding="utf-8")
+    predictable = path.with_suffix(".tmp")
+    predictable.symlink_to(redirected)
+
+    engine.atomic_write_json(path, {"safe": True})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"safe": True}
+    assert redirected.read_text(encoding="utf-8") == "keep-me"
+    assert predictable.is_symlink()
+
+
 def test_remote_metadata_strings_are_capped_before_state_retention():
     engine = load_engine()
     item = engine._base_item(

@@ -23,6 +23,7 @@ import re
 import selectors
 import signal
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -460,15 +461,39 @@ def ensure_dirs():
         pass
 
 
-def load_json(path, default, max_bytes=MAX_PERSISTED_JSON_BYTES):
-    """Read at most one bounded JSON document before parsing it."""
+def _read_bounded_regular_file(path, max_bytes):
+    """Read a caller-owned regular file through a bounded, fixed descriptor."""
+    limit = _bounded_int(
+        max_bytes, MAX_PERSISTED_JSON_BYTES, 0, MAX_PERSISTED_JSON_BYTES
+    )
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
     try:
-        with open(path, "rb") as fh:
-            raw = fh.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            return default
+        fd = os.open(os.fspath(path), flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        raw = os.read(fd, limit + 1)
+        if len(raw) > limit:
+            return None
+        return raw
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def load_json(path, default, max_bytes=MAX_PERSISTED_JSON_BYTES):
+    """Read at most one bounded, caller-owned regular JSON file."""
+    raw = _read_bounded_regular_file(path, max_bytes)
+    if raw is None:
+        return default
+    try:
         return json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError, TypeError):
+    except (UnicodeDecodeError, ValueError, TypeError):
         return default
 
 
@@ -494,10 +519,36 @@ def atomic_write_json(path, data, max_bytes=MAX_PERSISTED_JSON_BYTES):
     if len(payload) > max_bytes:
         raise ValueError("JSON state exceeds the configured size limit")
     path = Path(path)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "wb") as fh:
-        fh.write(payload)
-    os.replace(tmp, path)
+    tmp_name = None
+    open_fd = None
+    try:
+        # mkstemp uses a random name and O_EXCL, so a pre-existing sibling
+        # cannot redirect the write through a symlink.
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}-", suffix=".tmp", dir=path.parent
+        )
+        open_fd = tmp_fd
+        os.fchmod(tmp_fd, 0o600)
+        with os.fdopen(tmp_fd, "wb") as fh:
+            open_fd = None
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if open_fd is not None:
+            try:
+                os.close(open_fd)
+            except OSError:
+                pass
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
 
 def load_config():
