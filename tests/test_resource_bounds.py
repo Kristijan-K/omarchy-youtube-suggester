@@ -7,6 +7,8 @@ import os
 import pathlib
 import sys
 
+import pytest
+
 
 BIN_PATH = pathlib.Path(__file__).resolve().parents[1] / "bin" / "omarchy-youtube-suggester"
 SERVICE_PATH = BIN_PATH.parents[1] / "Service.qml"
@@ -64,6 +66,48 @@ def test_persisted_json_requires_owned_regular_file(tmp_path, monkeypatch):
     real_uid = os.getuid()
     monkeypatch.setattr(engine.os, "getuid", lambda: real_uid + 1)
     assert engine.load_json(target, default) == default
+
+
+def test_persistence_rejects_a_private_directory_symlink(tmp_path, monkeypatch):
+    engine = load_engine()
+    config_target = tmp_path / "config-target"
+    config_target.mkdir()
+    config_link = tmp_path / "config"
+    config_link.symlink_to(config_target, target_is_directory=True)
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(engine, "CONFIG_DIR", config_link)
+    monkeypatch.setattr(engine, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(engine, "LEGACY_COOKIES_FILE", cache_dir / "cookies.txt")
+
+    with pytest.raises(OSError):
+        engine.ensure_dirs()
+
+
+def test_persistence_stays_beneath_verified_directory_after_swap(tmp_path, monkeypatch):
+    engine = load_engine()
+    config_dir = tmp_path / "config"
+    cache_dir = tmp_path / "cache"
+    config_dir.mkdir()
+    cache_dir.mkdir()
+    monkeypatch.setattr(engine, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(engine, "CACHE_DIR", cache_dir)
+    monkeypatch.setattr(engine, "LEGACY_COOKIES_FILE", cache_dir / "cookies.txt")
+    engine.ensure_dirs()
+
+    held_dir = tmp_path / "config-held"
+    redirected_dir = tmp_path / "redirected"
+    redirected_dir.mkdir()
+    config_dir.rename(held_dir)
+    config_dir.symlink_to(redirected_dir, target_is_directory=True)
+    state_path = config_dir / "state.json"
+
+    engine.atomic_write_json(state_path, {"safe": True})
+
+    assert json.loads((held_dir / "state.json").read_text(encoding="utf-8")) == {
+        "safe": True
+    }
+    assert not (redirected_dir / "state.json").exists()
+    assert engine.load_json(state_path, {}) == {"safe": True}
 
 
 def test_atomic_json_write_ignores_predictable_temp_symlink(tmp_path):

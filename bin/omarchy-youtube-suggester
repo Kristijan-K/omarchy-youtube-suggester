@@ -21,6 +21,7 @@ import json
 import os
 import re
 import selectors
+import secrets
 import signal
 import shutil
 import stat
@@ -359,7 +360,8 @@ def _webkit_to_unix(microseconds):
 def _write_secure_cookie_file(lines):
     """Create a mode-0600 cookie file that the caller must remove."""
     ensure_dirs()
-    fd, name = tempfile.mkstemp(prefix=".cookies-", suffix=".txt", dir=CACHE_DIR)
+    directory_fd = _private_directory_fd(CACHE_DIR)
+    fd, name = _open_private_temp(directory_fd, ".cookies-", ".txt")
     open_fd = fd
     try:
         os.fchmod(fd, 0o600)
@@ -368,7 +370,7 @@ def _write_secure_cookie_file(lines):
             fh.write("\n".join(lines) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
-        return Path(name)
+        return CACHE_DIR / name
     except Exception:
         if open_fd is not None:
             try:
@@ -376,7 +378,7 @@ def _write_secure_cookie_file(lines):
             except OSError:
                 pass
         try:
-            Path(name).unlink()
+            os.unlink(name, dir_fd=directory_fd)
         except OSError:
             pass
         raise
@@ -445,16 +447,57 @@ def export_browser_cookies(browser):
 # persistence helpers
 
 
-def ensure_dirs():
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    for directory in (CONFIG_DIR, CACHE_DIR):
-        try:
-            os.chmod(directory, 0o700)
-        except OSError:
-            pass
+_PRIVATE_DIR_FDS = {}
+
+
+def _private_directory_fd(directory):
+    """Open and validate a private persistence directory once per process."""
+    directory = Path(directory)
+    key = os.path.abspath(os.fspath(directory))
+    cached = _PRIVATE_DIR_FDS.get(key)
+    if cached is not None:
+        return cached
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(os.fspath(directory), flags)
     try:
-        LEGACY_COOKIES_FILE.unlink()
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError("persistence directory must be a user-owned directory")
+        os.fchmod(fd, 0o700)
+    except Exception:
+        os.close(fd)
+        raise
+    _PRIVATE_DIR_FDS[key] = fd
+    return fd
+
+
+def _private_file_parts(path):
+    path = Path(path)
+    return _private_directory_fd(path.parent), path.name
+
+
+def _open_private_temp(directory_fd, prefix, suffix):
+    """Create a random mode-0600 file beneath a verified directory fd."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    for _ in range(16):
+        name = f"{prefix}{secrets.token_hex(16)}{suffix}"
+        try:
+            return os.open(name, flags, 0o600, dir_fd=directory_fd), name
+        except FileExistsError:
+            continue
+    raise FileExistsError("could not allocate a private temporary file")
+
+
+def ensure_dirs():
+    for directory in (CONFIG_DIR, CACHE_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+        _private_directory_fd(directory)
+    cache_fd = _private_directory_fd(CACHE_DIR)
+    try:
+        os.unlink(LEGACY_COOKIES_FILE.name, dir_fd=cache_fd)
     except FileNotFoundError:
         pass
     except OSError:
@@ -469,7 +512,8 @@ def _read_bounded_regular_file(path, max_bytes):
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
     flags |= getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(os.fspath(path), flags)
+        directory_fd, name = _private_file_parts(path)
+        fd = os.open(name, flags, dir_fd=directory_fd)
     except OSError:
         return None
     try:
@@ -519,14 +563,11 @@ def atomic_write_json(path, data, max_bytes=MAX_PERSISTED_JSON_BYTES):
     if len(payload) > max_bytes:
         raise ValueError("JSON state exceeds the configured size limit")
     path = Path(path)
+    directory_fd, name = _private_file_parts(path)
     tmp_name = None
     open_fd = None
     try:
-        # mkstemp uses a random name and O_EXCL, so a pre-existing sibling
-        # cannot redirect the write through a symlink.
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{path.name}-", suffix=".tmp", dir=path.parent
-        )
+        tmp_fd, tmp_name = _open_private_temp(directory_fd, f".{name}-", ".tmp")
         open_fd = tmp_fd
         os.fchmod(tmp_fd, 0o600)
         with os.fdopen(tmp_fd, "wb") as fh:
@@ -534,7 +575,12 @@ def atomic_write_json(path, data, max_bytes=MAX_PERSISTED_JSON_BYTES):
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_name, path)
+        os.replace(
+            tmp_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
         tmp_name = None
     finally:
         if open_fd is not None:
@@ -544,7 +590,7 @@ def atomic_write_json(path, data, max_bytes=MAX_PERSISTED_JSON_BYTES):
                 pass
         if tmp_name is not None:
             try:
-                os.unlink(tmp_name)
+                os.unlink(tmp_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -871,7 +917,8 @@ def cookie_args(browser):
         yield ["--cookies", str(exported)]
     finally:
         try:
-            Path(exported).unlink()
+            directory_fd, name = _private_file_parts(exported)
+            os.unlink(name, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
         except OSError:
