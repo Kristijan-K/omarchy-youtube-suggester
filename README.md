@@ -50,9 +50,11 @@ Browser must be logged into YouTube matching `browser` setting (`chromium` defau
 
 **Plugin privilege:** This plugin runs unsandboxed with your user privileges (same as the Omarchy shell process). Review [`bin/omarchy-youtube-suggester`](bin/omarchy-youtube-suggester) before enabling.
 
+**Browser credentials:** Decrypted cookies are held in bounded process memory and passed to each `yt-dlp` process through an anonymous Linux `memfd`; they are never written to a named cache file. Browser databases and sidecars are opened without following symlinks, required to be user-owned regular files, copied with byte limits into private runtime storage, and queried with row, value, profile, and time limits.
+
 **YouTube content is untrusted:** Video titles and descriptions come from YouTube. QML rendering sets `textFormat: Text.PlainText` (and `TextEdit.PlainText` for the description popup) on **every** `Text`/`TextEdit` element, so remote HTML like `<img src=…>` is never interpreted and no remote resources are fetched via `AutoText`.
 
-See `tests/test_no_transcription.py` and `tests/test_qml_safety.py` for regression coverage of the metadata-only and plain-text paths.
+See `tests/test_browser_security.py`, `tests/test_no_transcription.py`, and `tests/test_qml_safety.py` for regression coverage of browser isolation, the metadata-only pipeline, and plain-text rendering.
 
 ## Development & Tests
 

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.kkosu.youtube-suggester",
   "name": "YouTube Suggester",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Kristijan K",
   "license": "MIT",
   "description": "Scans your YouTube subscriptions (last 24h) + optional Recommended, classifies by your tags, and shows all per-tag + Others sorted by popularity with plain-text descriptions.",

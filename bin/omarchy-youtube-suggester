@@ -16,14 +16,15 @@ single JSON line, so the QML service can stream live progress.
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 import hashlib
+import hmac
 import json
 import os
 import re
 import selectors
 import secrets
 import signal
-import shutil
 import stat
 import sqlite3
 import subprocess
@@ -33,6 +34,7 @@ import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "youtube-suggester"
@@ -107,6 +109,21 @@ MAX_STATE_RECORDS = 300
 MAX_SEEN_IDS = 5000
 MAX_DETAIL_CHARS = 500
 MAX_ERROR_CHARS = 2000
+MAX_COOKIE_DB_BYTES = 64 * 1024 * 1024
+MAX_HISTORY_DB_BYTES = 256 * 1024 * 1024
+MAX_WAL_BYTES = 128 * 1024 * 1024
+MAX_SHM_BYTES = 16 * 1024 * 1024
+MAX_BROWSER_PROFILES = 32
+MAX_BROWSER_DIRECTORY_ENTRIES = 128
+MAX_COOKIE_ROWS = 10000
+MAX_HISTORY_ROWS = 100000
+MAX_HISTORY_IDS = 100000
+MAX_SQLITE_VALUE_BYTES = 1024 * 1024
+MAX_COOKIE_FIELD_BYTES = 64 * 1024
+MAX_COOKIE_PAYLOAD_BYTES = 4 * 1024 * 1024
+SQLITE_QUERY_TIMEOUT = 10
+VIDEO_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{11}")
+COOKIE_DOMAINS = ("google.com", "youtube.com")
 
 
 def _clip_text(value, max_chars, default=""):
@@ -126,14 +143,37 @@ def _bounded_int(value, default, minimum, maximum):
         return default
 
 
+def _exec_with_parent_death(expected_parent, argv):
+    """Exec a child that the kernel kills if this engine disappears."""
+    if not argv:
+        raise SystemExit("missing child command")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    except (AttributeError, OSError) as exc:
+        raise SystemExit(str(exc))
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
+    os.execvp(argv[0], argv)
+
+
 def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
-                stderr_limit=MAX_SUBPROCESS_STDERR_BYTES):
+                stderr_limit=MAX_SUBPROCESS_STDERR_BYTES, pass_fds=()):
     """Run a child while draining both pipes into fixed-size buffers."""
+    wrapped = [
+        sys.executable,
+        os.path.realpath(__file__),
+        "_exec-child",
+        str(os.getpid()),
+        *cmd,
+    ]
     process = subprocess.Popen(
-        cmd,
+        wrapped,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        pass_fds=tuple(pass_fds),
     )
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -301,25 +341,220 @@ def _keyring_safe_storage_secret(browser):
     return None
 
 
+def _open_directory_path(path):
+    """Open an absolute directory without following any path component."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("browser directory must be absolute")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open("/", flags)
+    try:
+        for part in path.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError("browser directory must be user-owned")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_profile_directory(root, profile):
+    root_fd = _open_directory_path(root)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        profile_fd = os.open(profile, flags, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+    info = os.fstat(profile_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        os.close(profile_fd)
+        raise PermissionError("browser profile must be user-owned")
+    return profile_fd
+
+
+def _open_bounded_regular_at(directory_fd, name, max_bytes, required=False):
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if required:
+            raise
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError(f"unsafe browser file: {name}")
+        if info.st_size < 0 or info.st_size > max_bytes:
+            raise ValueError(f"browser file exceeds limit: {name}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _profile_db_candidates(root, db_name, max_bytes):
+    """Return bounded direct-child browser DB candidates under one root."""
+    try:
+        root_fd = _open_directory_path(root)
+    except OSError:
+        return []
+    candidates = []
+    scanned = 0
+    try:
+        with os.scandir(root_fd) as entries:
+            for entry in entries:
+                scanned += 1
+                if (
+                    scanned > MAX_BROWSER_DIRECTORY_ENTRIES
+                    or len(candidates) >= MAX_BROWSER_PROFILES
+                ):
+                    break
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    profile_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_NOFOLLOW
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                        dir_fd=root_fd,
+                    )
+                    try:
+                        db_fd = _open_bounded_regular_at(
+                            profile_fd, db_name, max_bytes, required=True
+                        )
+                        try:
+                            mtime = os.fstat(db_fd).st_mtime
+                        finally:
+                            os.close(db_fd)
+                    finally:
+                        os.close(profile_fd)
+                    candidates.append((Path(root), entry.name, db_name, mtime))
+                except (OSError, ValueError):
+                    continue
+    finally:
+        os.close(root_fd)
+    return candidates
+
+
 def _find_browser_cookie_db(browser):
     info = CHROMIUM_BROWSERS.get(browser)
     if not info:
         return None
     candidates = []
     for root in info["roots"]:
-        if not root.is_dir():
-            continue
-        candidates.extend(root.glob("*/Cookies"))
-    if not candidates:
+        remaining = MAX_BROWSER_PROFILES - len(candidates)
+        candidates.extend(
+            _profile_db_candidates(root, "Cookies", MAX_COOKIE_DB_BYTES)[:remaining]
+        )
+        if len(candidates) >= MAX_BROWSER_PROFILES:
+            break
+    for candidate in candidates:
+        if candidate[1] == "Default":
+            return candidate
+    return max(candidates, key=lambda item: item[3]) if candidates else None
+
+
+def _copy_fd_bounded(source_fd, destination, max_bytes):
+    destination_fd = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    copied = 0
+    try:
+        while True:
+            chunk = os.read(source_fd, min(1024 * 1024, max_bytes - copied + 1))
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > max_bytes:
+                raise ValueError("browser file grew beyond its size limit")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("failed to copy browser file")
+                view = view[written:]
+    except Exception:
+        os.close(destination_fd)
+        try:
+            os.unlink(destination)
+        except OSError:
+            pass
+        raise
+    os.close(destination_fd)
+
+
+def _runtime_temp_parent():
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
         return None
-    # Prefer Default, otherwise the most recently used profile.
-    for cand in candidates:
-        if cand.parent.name == "Default":
-            return cand
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    try:
+        fd = _open_directory_path(value)
+    except (OSError, ValueError):
+        return None
+    os.close(fd)
+    return value
 
 
-def _decrypt_chromium_cookie(blob, os_secret):
+@contextmanager
+def _browser_db_snapshot(source, main_limit):
+    """Copy one fixed, validated browser DB snapshot into private runtime storage."""
+    root, profile, db_name, _mtime = source
+    with tempfile.TemporaryDirectory(
+        prefix="omarchy-youtube-suggester-", dir=_runtime_temp_parent()
+    ) as temp_dir:
+        profile_fd = _open_profile_directory(root, profile)
+        try:
+            destination = Path(temp_dir) / db_name
+            main_fd = _open_bounded_regular_at(
+                profile_fd, db_name, main_limit, required=True
+            )
+            try:
+                _copy_fd_bounded(main_fd, destination, main_limit)
+            finally:
+                os.close(main_fd)
+            for suffix, limit in (("-wal", MAX_WAL_BYTES), ("-shm", MAX_SHM_BYTES)):
+                sidecar_fd = _open_bounded_regular_at(profile_fd, db_name + suffix, limit)
+                if sidecar_fd is None:
+                    continue
+                try:
+                    _copy_fd_bounded(sidecar_fd, Path(str(destination) + suffix), limit)
+                finally:
+                    os.close(sidecar_fd)
+        finally:
+            os.close(profile_fd)
+        yield destination
+
+
+@contextmanager
+def _query_browser_snapshot(source, main_limit):
+    with _browser_db_snapshot(source, main_limit) as snapshot:
+        con = sqlite3.connect(snapshot.as_uri() + "?mode=ro", uri=True)
+        deadline = time.monotonic() + SQLITE_QUERY_TIMEOUT
+        try:
+            con.execute("PRAGMA query_only=ON")
+            con.execute("PRAGMA trusted_schema=OFF")
+            if hasattr(con, "setlimit") and hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
+                con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)
+            con.set_progress_handler(
+                lambda: 1 if time.monotonic() > deadline else 0, 10000
+            )
+            yield con
+        finally:
+            con.close()
+
+
+def _decrypt_chromium_cookie(blob, os_secret, host_key):
     if not blob:
         return None
     version, body = blob[:3], blob[3:]
@@ -340,9 +575,14 @@ def _decrypt_chromium_cookie(blob, os_secret):
             pad = dec[-1]
             if not (isinstance(pad, int) and 1 <= pad <= 16):
                 continue
+            if dec[-pad:] != bytes([pad]) * pad:
+                continue
             dec = dec[:-pad]
             if hash_prefix:
                 if len(dec) <= 32:
+                    continue
+                expected = hashlib.sha256(host_key.encode("utf-8")).digest()
+                if not hmac.compare_digest(dec[:32], expected):
                     continue
                 dec = dec[32:]
             return dec.decode("utf-8")
@@ -357,90 +597,82 @@ def _webkit_to_unix(microseconds):
     return int(microseconds / 1_000_000 - 11644473600)
 
 
-def _write_secure_cookie_file(lines):
-    """Create a mode-0600 cookie file that the caller must remove."""
-    ensure_dirs()
-    directory_fd = _private_directory_fd(CACHE_DIR)
-    fd, name = _open_private_temp(directory_fd, ".cookies-", ".txt")
-    open_fd = fd
+def _safe_cookie_field(value):
+    return (
+        isinstance(value, str)
+        and len(value.encode("utf-8")) <= MAX_COOKIE_FIELD_BYTES
+        and all(ord(char) >= 0x20 and ord(char) != 0x7F for char in value)
+    )
+
+
+def _cookie_row_line(row, secret):
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            open_fd = None
-            fh.write("\n".join(lines) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        return CACHE_DIR / name
-    except Exception:
-        if open_fd is not None:
-            try:
-                os.close(open_fd)
-            except OSError:
-                pass
-        try:
-            os.unlink(name, dir_fd=directory_fd)
-        except OSError:
-            pass
-        raise
+        host, name, value, encrypted, path, expires, secure = row
+        if not isinstance(host, str):
+            return None
+        normalized = host.lstrip(".").lower()
+        if not any(
+            normalized == domain or normalized.endswith("." + domain)
+            for domain in COOKIE_DOMAINS
+        ):
+            return None
+        if not value:
+            value = _decrypt_chromium_cookie(encrypted, secret, host)
+        path = path or "/"
+        if not all(_safe_cookie_field(field) for field in (host, name, value, path)):
+            return None
+        return "\t".join(
+            [
+                host,
+                "TRUE" if host.startswith(".") else "FALSE",
+                path,
+                "TRUE" if secure else "FALSE",
+                str(max(0, _webkit_to_unix(expires))),
+                name,
+                value,
+            ]
+        )
+    except (OverflowError, TypeError, ValueError):
+        return None
 
 
 def export_browser_cookies(browser):
-    """Decrypt the browser cookie DB into a Netscape cookies.txt file.
-
-    Returns the path on success, None when unsupported or nothing usable
-    was decrypted. The caller owns and must remove the temporary file.
-    """
+    """Return a bounded Netscape cookie payload without persisting plaintext."""
     if _AES is None or browser not in CHROMIUM_BROWSERS:
         return None
-    db_path = _find_browser_cookie_db(browser)
-    if not db_path:
+    source = _find_browser_cookie_db(browser)
+    if not source:
         return None
     secret = _keyring_safe_storage_secret(browser)
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            copy = Path(td) / "Cookies"
-            shutil.copy2(db_path, copy)
-            for sidecar in ("-wal", "-shm"):
-                src = Path(str(db_path) + sidecar)
-                if src.exists():
-                    shutil.copy2(src, Path(str(copy) + sidecar))
-            con = sqlite3.connect(str(copy))
-            try:
-                rows = con.execute(
-                    "SELECT host_key, name, value, encrypted_value, path, "
-                    "expires_utc, is_secure FROM cookies "
-                    "WHERE host_key LIKE '%youtube%' OR host_key LIKE '%google%'"
-                ).fetchall()
-            finally:
-                con.close()
-    except Exception:
-        return None
-
     lines = ["# Netscape HTTP Cookie File", "# Generated by omarchy-youtube-suggester"]
     count = 0
-    for host, name, value, enc, path, expires, secure in rows:
-        if not value:
-            value = _decrypt_chromium_cookie(enc, secret)
-        if not value:
-            continue
-        domain = host if host.startswith(".") else "." + host.lstrip(".")
-        lines.append(
-            "\t".join(
-                [
-                    domain,
-                    "TRUE",
-                    path or "/",
-                    "TRUE" if secure else "FALSE",
-                    str(max(0, _webkit_to_unix(expires))),
-                    name,
-                    value,
-                ]
+    payload_bytes = sum(len(line.encode("utf-8")) + 1 for line in lines)
+    try:
+        with _query_browser_snapshot(source, MAX_COOKIE_DB_BYTES) as con:
+            rows = con.execute(
+                "SELECT host_key, name, value, encrypted_value, path, "
+                "expires_utc, is_secure FROM cookies "
+                "WHERE host_key LIKE '%youtube%' OR host_key LIKE '%google%' "
+                "LIMIT ?",
+                (MAX_COOKIE_ROWS + 1,),
             )
-        )
-        count += 1
+            for index, row in enumerate(rows):
+                if index >= MAX_COOKIE_ROWS:
+                    return None
+                line = _cookie_row_line(row, secret)
+                if line is None:
+                    continue
+                line_bytes = len(line.encode("utf-8")) + 1
+                if payload_bytes + line_bytes > MAX_COOKIE_PAYLOAD_BYTES:
+                    return None
+                payload_bytes += line_bytes
+                lines.append(line)
+                count += 1
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
     if count < 5:  # a logged-in session always carries many google/youtube cookies
         return None
-    return _write_secure_cookie_file(lines)
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +732,16 @@ def ensure_dirs():
         os.unlink(LEGACY_COOKIES_FILE.name, dir_fd=cache_fd)
     except FileNotFoundError:
         pass
-    except OSError:
-        pass
+    with os.scandir(cache_fd) as entries:
+        for entry in entries:
+            if not (entry.name.startswith(".cookies-") and entry.name.endswith(".txt")):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                    os.unlink(entry.name, dir_fd=cache_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _read_bounded_regular_file(path, max_bytes):
@@ -641,7 +881,7 @@ def load_seen():
     return {
         video_id
         for video_id in ids[:MAX_SEEN_IDS]
-        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+        if isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id)
     }
 
 
@@ -650,7 +890,7 @@ def save_seen(seen):
     ids = sorted(
         video_id
         for video_id in seen
-        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+        if isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id)
     )[-MAX_SEEN_IDS:]
     atomic_write_json(SEEN_FILE, {"ids": ids})
 
@@ -663,7 +903,7 @@ def load_dismissed():
     ids = [
         video_id
         for video_id in ids[-MAX_SEEN_IDS:]
-        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+        if isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id)
     ]
     return set(ids), ids
 
@@ -674,7 +914,7 @@ def save_dismissed(dismissed_ids):
     ids = [
         video_id
         for video_id in list(dismissed_ids)[-MAX_SEEN_IDS:]
-        if isinstance(video_id, str) and re.fullmatch(r"[\w-]{11}", video_id)
+        if isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id)
     ]
     atomic_write_json(DISMISSED_FILE, {"ids": ids})
 
@@ -803,8 +1043,29 @@ def publish_state(state):
 
 
 def video_id_from_url(url):
-    m = re.search(r"(?:v=|youtu\.be/|shorts/)([\w-]{11})", url)
-    return m.group(1) if m else None
+    if not isinstance(url, str) or len(url) > 4096:
+        return None
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    video_id = None
+    if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+        if parsed.path == "/watch":
+            values = parse_qs(parsed.query, keep_blank_values=False).get("v", [])
+            video_id = values[0] if values else None
+        else:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) == 2 and parts[0] == "shorts":
+                video_id = parts[1]
+    elif host == "youtu.be":
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) == 1:
+            video_id = parts[0]
+    return video_id if isinstance(video_id, str) and VIDEO_ID_PATTERN.fullmatch(video_id) else None
 
 
 def collect_browser_history_ids():
@@ -813,9 +1074,10 @@ def collect_browser_history_ids():
 
     # Firefox profiles
     firefox_root = HOME / ".mozilla" / "firefox"
-    if firefox_root.is_dir():
-        for places in firefox_root.glob("*/places.sqlite"):
-            sources.append(("firefox", places))
+    for source in _profile_db_candidates(
+        firefox_root, "places.sqlite", MAX_HISTORY_DB_BYTES
+    )[:MAX_BROWSER_PROFILES]:
+        sources.append(("firefox", source))
 
     # Chromium family browsers
     for name, base in (
@@ -824,51 +1086,49 @@ def collect_browser_history_ids():
         ("brave", HOME / ".config" / "BraveSoftware" / "Brave-Browser"),
         ("edge", HOME / ".config" / "microsoft-edge"),
     ):
-        if base.is_dir():
-            for hist in base.glob("*/History"):
-                sources.append((name, hist))
+        if len(sources) >= MAX_BROWSER_PROFILES:
+            break
+        remaining = MAX_BROWSER_PROFILES - len(sources)
+        for source in _profile_db_candidates(
+            base, "History", MAX_HISTORY_DB_BYTES
+        )[:remaining]:
+            sources.append((name, source))
 
     clause = " OR ".join("url LIKE ?" for _ in WATCH_PATTERNS)
-    query = f"SELECT url FROM urls WHERE {clause}" if True else ""
-    for name, db in sources:
+    for name, source in sources[:MAX_BROWSER_PROFILES]:
+        table = "moz_places" if name == "firefox" else "urls"
+        order = "last_visit_date" if name == "firefox" else "last_visit_time"
+        query = (
+            f"SELECT url FROM {table} WHERE {clause} "
+            f"ORDER BY {order} DESC LIMIT ?"
+        )
         try:
-            with tempfile.TemporaryDirectory() as td:
-                copy = Path(td) / db.name
-                shutil.copy2(db, copy)
-                # Copy WAL sidecars when present so recent rows are visible.
-                for sidecar in ("-wal", "-shm"):
-                    src = Path(str(db) + sidecar)
-                    if src.exists():
-                        shutil.copy2(src, Path(str(copy) + sidecar))
-                con = sqlite3.connect(str(copy))
-                try:
-                    cur = con.execute(query, WATCH_PATTERNS)
-                    for (url,) in cur.fetchall():
-                        vid = video_id_from_url(url or "")
-                        if vid:
-                            ids.add(vid)
-                finally:
-                    con.close()
-        except Exception:
+            with _query_browser_snapshot(source, MAX_HISTORY_DB_BYTES) as con:
+                params = (*WATCH_PATTERNS, MAX_HISTORY_ROWS)
+                for (url,) in con.execute(query, params):
+                    vid = video_id_from_url(url)
+                    if vid:
+                        ids.add(vid)
+                        if len(ids) >= MAX_HISTORY_IDS:
+                            return ids
+        except (OSError, sqlite3.Error, TypeError, ValueError):
             continue  # unreadable profile: skip silently
     return ids
 
 
-def fetch_account_history_ids(cfg, auth_args=None):
+def fetch_account_history_ids(cfg, auth=None):
     """Best-effort: recent watch-history entries from the YouTube account.
 
     Catches videos watched on other devices; requires working cookies and
     history being enabled on the account.
     """
-    if auth_args is None:
-        with cookie_args(cfg.get("browser")) as scoped_args:
-            return fetch_account_history_ids(cfg, scoped_args)
+    if auth is None:
+        with cookie_args(cfg.get("browser")) as scoped_auth:
+            return fetch_account_history_ids(cfg, scoped_auth)
     limit = _bounded_int(cfg.get("account_history_limit"), 200, 1, 1000)
     ids = set()
     try:
-        cmd = [
-            "yt-dlp",
-            *auth_args,
+        arguments = [
             "--flat-playlist",
             "--no-warnings",
             "--quiet",
@@ -878,12 +1138,12 @@ def fetch_account_history_ids(cfg, auth_args=None):
             "%(id)s",
             ":ythistory",
         ]
-        proc, limited = run_bounded(cmd, timeout=120)
+        proc, limited = _run_ytdlp(arguments, auth, timeout=120)
         if limited:
             return ids
         for line in proc.stdout.splitlines():
             vid = line.strip()
-            if re.fullmatch(r"[\w-]{11}", vid):
+            if VIDEO_ID_PATTERN.fullmatch(vid):
                 ids.add(vid)
                 if len(ids) >= limit:
                     break
@@ -896,44 +1156,74 @@ def fetch_account_history_ids(cfg, auth_args=None):
 # feed fetching (yt-dlp + browser cookies)
 
 
+class BrowserAuth:
+    def __init__(self, cookie_payload=None, fallback_browser=None):
+        self.cookie_payload = cookie_payload
+        self.fallback_browser = fallback_browser
+
+
+def _browser_auth(browser):
+    if not browser or browser == "none":
+        return BrowserAuth()
+    if browser in CHROMIUM_BROWSERS and _AES is not None:
+        payload = export_browser_cookies(browser)
+        if payload is None:
+            raise RuntimeError("could not safely export browser cookies")
+        return BrowserAuth(cookie_payload=payload)
+    if browser not in {
+        "brave", "chrome", "chromium", "edge", "firefox", "opera", "vivaldi"
+    }:
+        raise ValueError("unsupported browser")
+    return BrowserAuth(fallback_browser=browser)
+
+
 @contextmanager
 def cookie_args(browser):
-    """Yield yt-dlp auth args and remove any exported cookie file afterward."""
-    if not browser or browser == "none":
-        yield []
-        return
+    """Yield an in-memory authentication session."""
+    yield _browser_auth(browser)
 
-    exported = None
-    if _AES is not None:
-        try:
-            exported = export_browser_cookies(browser)
-        except Exception:
-            exported = None
-    if not exported:
-        yield ["--cookies-from-browser", browser]
-        return
 
+@contextmanager
+def _cookie_memfd(payload):
+    if not hasattr(os, "memfd_create"):
+        raise RuntimeError("anonymous cookie files require Linux memfd support")
+    fd = os.memfd_create(
+        "omarchy-youtube-cookies", getattr(os, "MFD_CLOEXEC", 0x0001)
+    )
     try:
-        yield ["--cookies", str(exported)]
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("failed to write anonymous cookie file")
+            view = view[written:]
+        os.lseek(fd, 0, os.SEEK_SET)
+        yield ["--cookies", f"/proc/self/fd/{fd}"], (fd,)
     finally:
-        try:
-            directory_fd, name = _private_file_parts(exported)
-            os.unlink(name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        os.close(fd)
 
 
-def fetch_feed(cfg, auth_args=None):
+def _run_ytdlp(arguments, auth, timeout):
+    auth = auth or BrowserAuth()
+    if auth.cookie_payload is not None:
+        with _cookie_memfd(auth.cookie_payload) as (auth_args, pass_fds):
+            return run_bounded(
+                ["yt-dlp", *auth_args, *arguments], timeout=timeout, pass_fds=pass_fds
+            )
+    auth_args = (
+        ["--cookies-from-browser", auth.fallback_browser]
+        if auth.fallback_browser else []
+    )
+    return run_bounded(["yt-dlp", *auth_args, *arguments], timeout=timeout)
+
+
+def fetch_feed(cfg, auth=None):
     """Return raw entries from the logged-in subscriptions feed."""
-    if auth_args is None:
-        with cookie_args(cfg.get("browser")) as scoped_args:
-            return fetch_feed(cfg, scoped_args)
+    if auth is None:
+        with cookie_args(cfg.get("browser")) as scoped_auth:
+            return fetch_feed(cfg, scoped_auth)
     feed_limit = _bounded_int(cfg.get("feed_limit"), 120, 1, 500)
-    cmd = [
-        "yt-dlp",
-        *auth_args,
+    arguments = [
         "--flat-playlist",
         "--no-warnings",
         "--quiet",
@@ -942,7 +1232,7 @@ def fetch_feed(cfg, auth_args=None):
         "--dump-json",
         "https://www.youtube.com/feed/subscriptions",
     ]
-    proc, limited = run_bounded(cmd, timeout=240)
+    proc, limited = _run_ytdlp(arguments, auth, timeout=240)
     if limited:
         raise RuntimeError("yt-dlp feed output or timeout limit reached")
     entries = []
@@ -957,7 +1247,7 @@ def fetch_feed(cfg, auth_args=None):
         if not isinstance(data, dict):
             continue
         vid = data.get("id") or ""
-        if not isinstance(vid, str) or not re.fullmatch(r"[\w-]{11}", vid):
+        if not isinstance(vid, str) or not VIDEO_ID_PATTERN.fullmatch(vid):
             continue
 
         def num(value):
@@ -990,25 +1280,23 @@ def fetch_feed(cfg, auth_args=None):
     return entries
 
 
-def fetch_recommended(cfg, limit=None, auth_args=None):
+def fetch_recommended(cfg, limit=None, auth=None):
     """Return raw entries from YouTube's personalized Recommended feed.
 
     Uses the same cookie handling as the subscriptions feed. Returns [] on
     failure (e.g., not logged in or feed empty) so the caller can fall back
     to subscriptions only.
     """
-    if auth_args is None:
-        with cookie_args(cfg.get("browser")) as scoped_args:
-            return fetch_recommended(cfg, limit, scoped_args)
+    if auth is None:
+        with cookie_args(cfg.get("browser")) as scoped_auth:
+            return fetch_recommended(cfg, limit, scoped_auth)
     feed_limit = _bounded_int(limit or cfg.get("feed_limit"), 120, 1, 500)
     # Both URLs are tried; yt-dlp maps them to youtube:recommended extractor.
     for url in (
         "https://www.youtube.com/feed/recommended",
         ":ytrec",
     ):
-        cmd = [
-            "yt-dlp",
-            *auth_args,
+        arguments = [
             "--flat-playlist",
             "--no-warnings",
             "--quiet",
@@ -1017,7 +1305,7 @@ def fetch_recommended(cfg, limit=None, auth_args=None):
             "--dump-json",
             url,
         ]
-        proc, limited = run_bounded(cmd, timeout=240)
+        proc, limited = _run_ytdlp(arguments, auth, timeout=240)
         if limited:
             continue
         entries = []
@@ -1032,7 +1320,7 @@ def fetch_recommended(cfg, limit=None, auth_args=None):
             if not isinstance(data, dict):
                 continue
             vid = data.get("id") or ""
-            if not isinstance(vid, str) or not re.fullmatch(r"[\w-]{11}", vid):
+            if not isinstance(vid, str) or not VIDEO_ID_PATTERN.fullmatch(vid):
                 continue
 
             def num(value):
@@ -1067,21 +1355,19 @@ def fetch_recommended(cfg, limit=None, auth_args=None):
 # metadata (tags/description) fetching + scoring
 
 
-def fetch_metadata(cfg, video_id, auth_args=None):
+def fetch_metadata(cfg, video_id, auth=None):
     """Fetch one video's metadata JSON (tags, description, …) — no download."""
-    if auth_args is None:
-        with cookie_args(cfg.get("browser")) as scoped_args:
-            return fetch_metadata(cfg, video_id, scoped_args)
-    cmd = [
-        "yt-dlp",
-        *auth_args,
+    if auth is None:
+        with cookie_args(cfg.get("browser")) as scoped_auth:
+            return fetch_metadata(cfg, video_id, scoped_auth)
+    arguments = [
         "--skip-download",
         "--no-warnings",
         "--quiet",
         "--dump-json",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    proc, limited = run_bounded(cmd, timeout=60)
+    proc, limited = _run_ytdlp(arguments, auth, timeout=60)
     if limited:
         return None
     for line in proc.stdout.splitlines():
@@ -1346,22 +1632,27 @@ def run_pipeline(limit=None, include_recommended=False):
     publish_state(state)
 
     watched = collect_browser_history_ids() | load_seen()
+    try:
+        auth = _browser_auth(cfg.get("browser"))
+    except Exception as exc:
+        publish_state(new_state(stage="error", error=str(exc), interests=interests))
+        return
     if cfg.get("use_account_history", True):
         state = dict(state, detail="Fetching account watch history…")
         publish_state(state)
-        watched |= fetch_account_history_ids(cfg)
+        watched |= fetch_account_history_ids(cfg, auth)
     state["watched_count"] = len(watched)
 
     state = dict(state, stage="feed", detail="Fetching subscriptions feed…")
     publish_state(state)
     try:
-        entries = fetch_feed(cfg)
+        entries = fetch_feed(cfg, auth)
         for e in entries:
             e["source"] = "subs"
         if include_recommended:
             state = dict(state, detail="Fetching YouTube Recommended…")
             publish_state(state)
-            rec_entries = fetch_recommended(cfg, limit=20)
+            rec_entries = fetch_recommended(cfg, limit=20, auth=auth)
             for e in rec_entries:
                 e["source"] = "rec"
             seen_ids = {e["id"] for e in entries}
@@ -1385,7 +1676,7 @@ def run_pipeline(limit=None, include_recommended=False):
     # Score metadata (title/tags/description) concurrently; no media downloads.
     def _meta_job(entry):
         try:
-            meta = fetch_metadata(cfg, entry["id"])
+            meta = fetch_metadata(cfg, entry["id"], auth)
         except Exception:
             meta = None
         return entry, meta
@@ -1543,7 +1834,7 @@ def cmd_watch(_args):
 
 def cmd_open(args):
     vid = args.video_id
-    if not re.fullmatch(r"[\w-]{11}", vid):
+    if not VIDEO_ID_PATTERN.fullmatch(vid):
         raise SystemExit("invalid YouTube video id")
     seen = load_seen()
     seen.add(vid)
@@ -1641,6 +1932,10 @@ def cmd_feed(args):
 
 
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "_exec-child":
+        _exec_with_parent_death(int(sys.argv[2]), sys.argv[3:])
+        return
+
     parser = argparse.ArgumentParser(prog="omarchy-youtube-suggester")
     sub = parser.add_subparsers(dest="command", required=True)
 

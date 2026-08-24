@@ -185,7 +185,7 @@ def test_qml_process_output_is_not_collected_without_a_bound():
     assert "maxErrorOutputChars" in source
 
 
-def test_cookie_export_is_private_and_scoped(tmp_path, monkeypatch):
+def test_cookie_auth_uses_anonymous_memfd(tmp_path, monkeypatch):
     engine = load_engine()
     monkeypatch.setattr(engine, "CONFIG_DIR", tmp_path / "config")
     monkeypatch.setattr(engine, "CACHE_DIR", tmp_path / "cache")
@@ -193,16 +193,23 @@ def test_cookie_export_is_private_and_scoped(tmp_path, monkeypatch):
         engine, "LEGACY_COOKIES_FILE", tmp_path / "cache" / "cookies.txt"
     )
 
-    exported = engine._write_secure_cookie_file(["secret-cookie"])
-    assert stat_mode(exported) == 0o600
-    assert exported.read_text(encoding="utf-8") == "secret-cookie\n"
+    seen = {}
 
-    monkeypatch.setattr(engine, "_AES", object())
-    monkeypatch.setattr(engine, "export_browser_cookies", lambda _browser: exported)
-    with engine.cookie_args("chromium") as args:
-        assert args == ["--cookies", str(exported)]
-        assert exported.exists()
-    assert not exported.exists()
+    def fake_run(cmd, timeout, pass_fds=(), **_kwargs):
+        seen["cmd"] = cmd
+        seen["fd"] = pass_fds[0]
+        seen["payload"] = os.pread(pass_fds[0], 100, 0)
+        return type("Result", (), {"stdout": "", "stderr": "", "returncode": 0})(), False
+
+    monkeypatch.setattr(engine, "run_bounded", fake_run)
+    auth = engine.BrowserAuth(cookie_payload=b"secret-cookie\n")
+    engine._run_ytdlp(["--version"], auth, timeout=1)
+
+    assert seen["cmd"][:3] == ["yt-dlp", "--cookies", f"/proc/self/fd/{seen['fd']}"]
+    assert seen["payload"] == b"secret-cookie\n"
+    with pytest.raises(OSError):
+        os.fstat(seen["fd"])
+    assert not list((tmp_path / "cache").glob(".cookies-*.txt"))
 
 
 def test_legacy_cookie_file_is_removed_on_startup(tmp_path, monkeypatch):
@@ -214,11 +221,13 @@ def test_legacy_cookie_file_is_removed_on_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "LEGACY_COOKIES_FILE", legacy)
     cache_dir.mkdir()
     legacy.write_text("old-secret", encoding="utf-8")
+    stale = cache_dir / (".cookies-" + "a" * 32 + ".txt")
+    stale.write_text("newer-secret", encoding="utf-8")
+    unrelated = cache_dir / ".cookies-not-ours.json"
+    unrelated.write_text("keep", encoding="utf-8")
 
     engine.ensure_dirs()
 
     assert not legacy.exists()
-
-
-def stat_mode(path):
-    return os.stat(path).st_mode & 0o777
+    assert not stale.exists()
+    assert unrelated.read_text(encoding="utf-8") == "keep"
