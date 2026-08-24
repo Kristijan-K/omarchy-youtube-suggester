@@ -199,6 +199,12 @@ def test_cookie_auth_uses_anonymous_memfd(tmp_path, monkeypatch):
         seen["cmd"] = cmd
         seen["fd"] = pass_fds[0]
         seen["payload"] = os.pread(pass_fds[0], 100, 0)
+        updated = (
+            b"# Netscape HTTP Cookie File\n"
+            b".google.com\tTRUE\t/\tTRUE\t0\tSID\tupdated\n"
+        )
+        os.ftruncate(pass_fds[0], 0)
+        os.pwrite(pass_fds[0], updated, 0)
         return type("Result", (), {"stdout": "", "stderr": "", "returncode": 0})(), False
 
     monkeypatch.setattr(engine, "run_bounded", fake_run)
@@ -207,9 +213,31 @@ def test_cookie_auth_uses_anonymous_memfd(tmp_path, monkeypatch):
 
     assert seen["cmd"][:3] == ["yt-dlp", "--cookies", f"/proc/self/fd/{seen['fd']}"]
     assert seen["payload"] == b"secret-cookie\n"
+    assert auth.snapshot().endswith(b"\tSID\tupdated\n")
     with pytest.raises(OSError):
         os.fstat(seen["fd"])
     assert not list((tmp_path / "cache").glob(".cookies-*.txt"))
+
+
+def test_failed_child_cannot_replace_cookie_auth(monkeypatch):
+    engine = load_engine()
+    original = (
+        b"# Netscape HTTP Cookie File\n"
+        b".google.com\tTRUE\t/\tTRUE\t0\tSID\toriginal\n"
+    )
+    auth = engine.BrowserAuth(cookie_payload=original)
+
+    def failed_run(_cmd, timeout, pass_fds=(), **_kwargs):
+        os.ftruncate(pass_fds[0], 0)
+        os.pwrite(pass_fds[0], b"# Netscape HTTP Cookie File\n", 0)
+        result = type("Result", (), {"stdout": "", "stderr": "", "returncode": -9})()
+        return result, True
+
+    monkeypatch.setattr(engine, "run_bounded", failed_run)
+
+    engine._run_ytdlp(["--version"], auth, timeout=1)
+
+    assert auth.snapshot() == original
 
 
 def test_legacy_cookie_file_is_removed_on_startup(tmp_path, monkeypatch):

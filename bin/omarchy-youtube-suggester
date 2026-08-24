@@ -30,6 +30,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -143,19 +144,40 @@ def _bounded_int(value, default, minimum, maximum):
         return default
 
 
-def _exec_with_parent_death(expected_parent, argv):
-    """Exec a child that the kernel kills if this engine disappears."""
+def _supervise_with_parent_death(expected_parent, argv):
+    """Keep a child process group tied to this engine's lifetime."""
     if not argv:
         raise SystemExit("missing child command")
+    child = None
+
+    def stop_child_group():
+        if child is None:
+            return
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def parent_gone(received_signal, _frame=None):
+        stop_child_group()
+        os._exit(128 + received_signal)
+
+    signal.signal(signal.SIGTERM, parent_gone)
+    signal.signal(signal.SIGINT, parent_gone)
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
+        if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG
             raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
     except (AttributeError, OSError) as exc:
         raise SystemExit(str(exc))
     if os.getppid() != expected_parent:
-        os.kill(os.getpid(), signal.SIGKILL)
-    os.execvp(argv[0], argv)
+        parent_gone(signal.SIGTERM)
+    child = subprocess.Popen(argv, close_fds=False, start_new_session=True)
+    try:
+        returncode = child.wait()
+    finally:
+        stop_child_group()
+    raise SystemExit(returncode)
 
 
 def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
@@ -175,9 +197,7 @@ def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
         start_new_session=True,
         pass_fds=tuple(pass_fds),
     )
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    selector = None
     buffers = {"stdout": bytearray(), "stderr": bytearray()}
     limits = {"stdout": stdout_limit, "stderr": stderr_limit}
     limited = False
@@ -190,16 +210,20 @@ def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
             return
         stopped = True
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.kill(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         except OSError:
             try:
-                process.kill()
+                process.terminate()
             except ProcessLookupError:
                 pass
 
+    returncode = None
     try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         while selector.get_map():
             if stopped:
                 wait = 0.1
@@ -236,7 +260,15 @@ def run_bounded(cmd, timeout, stdout_limit=MAX_SUBPROCESS_STDOUT_BYTES,
                     buffers[stream].extend(chunk)
         returncode = process.wait()
     finally:
-        selector.close()
+        if process.poll() is None:
+            stop_process()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        if selector is not None:
+            selector.close()
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
@@ -371,10 +403,13 @@ def _open_profile_directory(root, profile):
         profile_fd = os.open(profile, flags, dir_fd=root_fd)
     finally:
         os.close(root_fd)
-    info = os.fstat(profile_fd)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+    try:
+        info = os.fstat(profile_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise PermissionError("browser profile must be user-owned")
+    except Exception:
         os.close(profile_fd)
-        raise PermissionError("browser profile must be user-owned")
+        raise
     return profile_fd
 
 
@@ -494,6 +529,10 @@ def _copy_fd_bounded(source_fd, destination, max_bytes):
     os.close(destination_fd)
 
 
+def _file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def _runtime_temp_parent():
     value = os.environ.get("XDG_RUNTIME_DIR")
     if not value:
@@ -506,9 +545,27 @@ def _runtime_temp_parent():
     return value
 
 
+def _recover_private_snapshot(path, max_bytes):
+    """Apply copied WAL/journal data before reopening the snapshot read-only."""
+    con = sqlite3.connect(path, timeout=2)
+    deadline = time.monotonic() + SQLITE_QUERY_TIMEOUT
+    try:
+        con.execute("PRAGMA trusted_schema=OFF")
+        if hasattr(con, "setlimit") and hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
+            con.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)
+        con.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0, 10000
+        )
+        con.execute("PRAGMA schema_version").fetchone()
+    finally:
+        con.close()
+    if path.stat().st_size > max_bytes:
+        raise RuntimeError("recovered browser database exceeds its limit")
+
+
 @contextmanager
 def _browser_db_snapshot(source, main_limit):
-    """Copy one fixed, validated browser DB snapshot into private runtime storage."""
+    """Create a bounded snapshot, retrying if SQLite files change mid-copy."""
     root, profile, db_name, _mtime = source
     with tempfile.TemporaryDirectory(
         prefix="omarchy-youtube-suggester-", dir=_runtime_temp_parent()
@@ -516,24 +573,55 @@ def _browser_db_snapshot(source, main_limit):
         profile_fd = _open_profile_directory(root, profile)
         try:
             destination = Path(temp_dir) / db_name
-            main_fd = _open_bounded_regular_at(
-                profile_fd, db_name, main_limit, required=True
+            file_limits = (
+                (db_name, main_limit, True, True),
+                (db_name + "-wal", MAX_WAL_BYTES, False, True),
+                (db_name + "-journal", MAX_WAL_BYTES, False, True),
+                (db_name + "-shm", MAX_SHM_BYTES, False, False),
             )
-            try:
-                _copy_fd_bounded(main_fd, destination, main_limit)
-            finally:
-                os.close(main_fd)
-            for suffix, limit in (("-wal", MAX_WAL_BYTES), ("-shm", MAX_SHM_BYTES)):
-                sidecar_fd = _open_bounded_regular_at(profile_fd, db_name + suffix, limit)
-                if sidecar_fd is None:
-                    continue
+            for _attempt in range(3):
+                records = []
                 try:
-                    _copy_fd_bounded(sidecar_fd, Path(str(destination) + suffix), limit)
+                    for name, limit, required, should_copy in file_limits:
+                        fd = _open_bounded_regular_at(
+                            profile_fd, name, limit, required=required
+                        )
+                        identity = _file_identity(os.fstat(fd)) if fd is not None else None
+                        records.append((name, limit, should_copy, fd, identity))
+
+                    for name, limit, should_copy, fd, _identity in records:
+                        if fd is not None and should_copy:
+                            target = destination if name == db_name else Path(temp_dir) / name
+                            _copy_fd_bounded(fd, target, limit)
+
+                    stable = True
+                    for name, limit, _should_copy, fd, identity in records:
+                        if fd is not None and _file_identity(os.fstat(fd)) != identity:
+                            stable = False
+                        current_fd = _open_bounded_regular_at(profile_fd, name, limit)
+                        try:
+                            current = (
+                                _file_identity(os.fstat(current_fd))
+                                if current_fd is not None else None
+                            )
+                        finally:
+                            if current_fd is not None:
+                                os.close(current_fd)
+                        if current != identity:
+                            stable = False
+                    if stable:
+                        _recover_private_snapshot(destination, main_limit)
+                        yield destination
+                        return
                 finally:
-                    os.close(sidecar_fd)
+                    for _name, _limit, _copy, fd, _identity in records:
+                        if fd is not None:
+                            os.close(fd)
+                for path in Path(temp_dir).iterdir():
+                    path.unlink()
+            raise RuntimeError("browser database changed during snapshot")
         finally:
             os.close(profile_fd)
-        yield destination
 
 
 @contextmanager
@@ -554,20 +642,20 @@ def _query_browser_snapshot(source, main_limit):
             con.close()
 
 
-def _decrypt_chromium_cookie(blob, os_secret, host_key):
+def _decrypt_chromium_cookie(blob, os_secret, host_key, has_host_hash):
     if not blob:
         return None
     version, body = blob[:3], blob[3:]
     if version == b"v10":
-        attempts = [(b"peanuts", False)]
+        attempts = [b"peanuts"]
     elif version == b"v11":
         attempts = []
         if os_secret:
-            attempts.append((os_secret, True))
-        attempts.append((b"peanuts", True))
+            attempts.append(os_secret)
+        attempts.append(b"peanuts")
     else:
         return None
-    for password, hash_prefix in attempts:
+    for password in attempts:
         try:
             dec = _AES.new(_pbkdf2_key(password), _AES.MODE_CBC, b" " * 16).decrypt(
                 body
@@ -578,7 +666,7 @@ def _decrypt_chromium_cookie(blob, os_secret, host_key):
             if dec[-pad:] != bytes([pad]) * pad:
                 continue
             dec = dec[:-pad]
-            if hash_prefix:
+            if has_host_hash:
                 if len(dec) <= 32:
                     continue
                 expected = hashlib.sha256(host_key.encode("utf-8")).digest()
@@ -605,7 +693,7 @@ def _safe_cookie_field(value):
     )
 
 
-def _cookie_row_line(row, secret):
+def _cookie_row_line(row, secret, has_host_hash=False):
     try:
         host, name, value, encrypted, path, expires, secure = row
         if not isinstance(host, str):
@@ -617,7 +705,9 @@ def _cookie_row_line(row, secret):
         ):
             return None
         if not value:
-            value = _decrypt_chromium_cookie(encrypted, secret, host)
+            value = _decrypt_chromium_cookie(
+                encrypted, secret, host, has_host_hash
+            )
         path = path or "/"
         if not all(_safe_cookie_field(field) for field in (host, name, value, path)):
             return None
@@ -649,6 +739,16 @@ def export_browser_cookies(browser):
     payload_bytes = sum(len(line.encode("utf-8")) + 1 for line in lines)
     try:
         with _query_browser_snapshot(source, MAX_COOKIE_DB_BYTES) as con:
+            try:
+                meta_row = con.execute(
+                    "SELECT value FROM meta WHERE key='version' LIMIT 1"
+                ).fetchone()
+            except sqlite3.Error:
+                meta_row = None
+            meta_version = _bounded_int(
+                meta_row[0] if meta_row else 0, 0, 0, 1000000
+            )
+            has_host_hash = meta_version >= 24
             rows = con.execute(
                 "SELECT host_key, name, value, encrypted_value, path, "
                 "expires_utc, is_secure FROM cookies "
@@ -659,7 +759,7 @@ def export_browser_cookies(browser):
             for index, row in enumerate(rows):
                 if index >= MAX_COOKIE_ROWS:
                     return None
-                line = _cookie_row_line(row, secret)
+                line = _cookie_row_line(row, secret, has_host_hash)
                 if line is None:
                     continue
                 line_bytes = len(line.encode("utf-8")) + 1
@@ -668,7 +768,7 @@ def export_browser_cookies(browser):
                 payload_bytes += line_bytes
                 lines.append(line)
                 count += 1
-    except (OSError, sqlite3.Error, TypeError, ValueError):
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
         return None
     if count < 5:  # a logged-in session always carries many google/youtube cookies
         return None
@@ -1053,7 +1153,9 @@ def video_id_from_url(url):
         return None
     host = (parsed.hostname or "").lower().rstrip(".")
     video_id = None
-    if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+    if host in (
+        "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"
+    ):
         if parsed.path == "/watch":
             values = parse_qs(parsed.query, keep_blank_values=False).get("v", [])
             video_id = values[0] if values else None
@@ -1111,7 +1213,7 @@ def collect_browser_history_ids():
                         ids.add(vid)
                         if len(ids) >= MAX_HISTORY_IDS:
                             return ids
-        except (OSError, sqlite3.Error, TypeError, ValueError):
+        except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
             continue  # unreadable profile: skip silently
     return ids
 
@@ -1160,12 +1262,58 @@ class BrowserAuth:
     def __init__(self, cookie_payload=None, fallback_browser=None):
         self.cookie_payload = cookie_payload
         self.fallback_browser = fallback_browser
+        self._lock = threading.Lock()
+
+    def snapshot(self):
+        with self._lock:
+            return self.cookie_payload
+
+    def update(self, payload):
+        with self._lock:
+            self.cookie_payload = payload
+
+
+def _valid_netscape_cookie_payload(payload):
+    if not payload or len(payload) > MAX_COOKIE_PAYLOAD_BYTES or not payload.endswith(b"\n"):
+        return False
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return False
+    if not lines or lines[0] != "# Netscape HTTP Cookie File":
+        return False
+    records = 0
+    for line in lines[1:]:
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            return False
+        host = fields[0].removeprefix("#HttpOnly_")
+        normalized = host.lstrip(".").lower()
+        if not any(
+            normalized == domain or normalized.endswith("." + domain)
+            for domain in COOKIE_DOMAINS
+        ):
+            return False
+        if fields[1] not in ("TRUE", "FALSE") or fields[3] not in ("TRUE", "FALSE"):
+            return False
+        try:
+            int(fields[4])
+        except ValueError:
+            return False
+        if not all(_safe_cookie_field(field) for field in (host, fields[2], fields[5], fields[6])):
+            return False
+        records += 1
+    return records > 0
 
 
 def _browser_auth(browser):
     if not browser or browser == "none":
         return BrowserAuth()
-    if browser in CHROMIUM_BROWSERS and _AES is not None:
+    if browser in CHROMIUM_BROWSERS:
+        if _AES is None:
+            raise RuntimeError("safe Chromium cookie export requires pycryptodomex")
         payload = export_browser_cookies(browser)
         if payload is None:
             raise RuntimeError("could not safely export browser cookies")
@@ -1203,13 +1351,20 @@ def _cookie_memfd(payload):
         os.close(fd)
 
 
-def _run_ytdlp(arguments, auth, timeout):
+def _run_ytdlp(arguments, auth, timeout, update_auth=True):
     auth = auth or BrowserAuth()
-    if auth.cookie_payload is not None:
-        with _cookie_memfd(auth.cookie_payload) as (auth_args, pass_fds):
-            return run_bounded(
+    cookie_payload = auth.snapshot()
+    if cookie_payload is not None:
+        with _cookie_memfd(cookie_payload) as (auth_args, pass_fds):
+            result = run_bounded(
                 ["yt-dlp", *auth_args, *arguments], timeout=timeout, pass_fds=pass_fds
             )
+            process_result, limited = result
+            if update_auth and process_result.returncode == 0 and not limited:
+                updated = os.pread(pass_fds[0], MAX_COOKIE_PAYLOAD_BYTES + 1, 0)
+                if _valid_netscape_cookie_payload(updated):
+                    auth.update(updated)
+            return result
     auth_args = (
         ["--cookies-from-browser", auth.fallback_browser]
         if auth.fallback_browser else []
@@ -1367,7 +1522,7 @@ def fetch_metadata(cfg, video_id, auth=None):
         "--dump-json",
         f"https://www.youtube.com/watch?v={video_id}",
     ]
-    proc, limited = _run_ytdlp(arguments, auth, timeout=60)
+    proc, limited = _run_ytdlp(arguments, auth, timeout=60, update_auth=False)
     if limited:
         return None
     for line in proc.stdout.splitlines():
@@ -1933,7 +2088,7 @@ def cmd_feed(args):
 
 def main():
     if len(sys.argv) >= 4 and sys.argv[1] == "_exec-child":
-        _exec_with_parent_death(int(sys.argv[2]), sys.argv[3:])
+        _supervise_with_parent_death(int(sys.argv[2]), sys.argv[3:])
         return
 
     parser = argparse.ArgumentParser(prog="omarchy-youtube-suggester")

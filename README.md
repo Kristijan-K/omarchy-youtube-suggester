@@ -50,7 +50,7 @@ Browser must be logged into YouTube matching `browser` setting (`chromium` defau
 
 **Plugin privilege:** This plugin runs unsandboxed with your user privileges (same as the Omarchy shell process). Review [`bin/omarchy-youtube-suggester`](bin/omarchy-youtube-suggester) before enabling.
 
-**Browser credentials:** Decrypted cookies are held in bounded process memory and passed to each `yt-dlp` process through an anonymous Linux `memfd`; they are never written to a named cache file. Browser databases and sidecars are opened without following symlinks, required to be user-owned regular files, copied with byte limits into private runtime storage, and queried with row, value, profile, and time limits.
+**Browser credentials:** Chrome, Chromium, Brave, and Edge cookies decrypted by the plugin are held in bounded process memory and passed to each `yt-dlp` process through an anonymous Linux `memfd`; they are never written to a named cache file. Browser databases and sidecars are opened without following symlinks, required to be user-owned regular files, backed up with byte limits into private runtime storage, and queried with row, value, profile, and time limits. Other supported browsers use `yt-dlp`'s native browser-cookie support.
 
 **YouTube content is untrusted:** Video titles and descriptions come from YouTube. QML rendering sets `textFormat: Text.PlainText` (and `TextEdit.PlainText` for the description popup) on **every** `Text`/`TextEdit` element, so remote HTML like `<img src=…>` is never interpreted and no remote resources are fetched via `AutoText`.
 
